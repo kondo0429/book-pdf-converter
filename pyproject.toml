@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "cython>=3.0", "numpy>=1.20"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book-pdf-converter"
+version = "0.1.0"
+description = "PDF converter with AI enhancement for scanned documents"
+requires-python = ">=3.10,<3.14"
+license = "AGPL-3.0-or-later"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pillow>=10.0",
+    "pymupdf>=1.23",
+    "pytesseract>=0.3.10",
+    "torch>=2.0",
+    "coremltools>=7.0; sys_platform == 'darwin'",
+    "spandrel>=0.1.0; sys_platform != 'darwin'",
+]
+
+[project.scripts]
+book-pdf-converter = "converter.cli:main"
+book-pdf-converter-batch = "converter.cli_batch:main"
+
+[tool.setuptools]
+packages = ["converter", "converter.models"]
+
+[tool.setuptools.package-data]
+converter = ["*.pyx", "*.so", "*.pyd"]
+"converter.models" = ["*.mlpackage", "*.pth", "*.onnx", ".gitkeep"]

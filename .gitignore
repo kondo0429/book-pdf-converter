@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Cython
+*.c
+!converter/image_processing_cy.c
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Models (users download these, not in git)
+converter/models/*.pth
+converter/models/*.mlpackage
+converter/models/*.onnx
+!converter/models/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Reference (original C# code, not distributed)
+reference/
