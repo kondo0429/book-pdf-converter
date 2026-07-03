@@ -88,6 +88,27 @@ Examples:
     parser.add_argument('--deskew-exclude-pages', type=str, default=None,
                         help='Page numbers (1-indexed) to skip deskew, e.g. "1,4,7-9"')
 
+    # Show-through (bleed-through) removal - on for all pages by default (grayscale output)
+    parser.add_argument('--no-bleed-removal', action='store_true',
+                        help='Disable show-through/background removal for all pages')
+    parser.add_argument('--bleed-removal-exclude-pages', type=str, default=None,
+                        help='Page numbers (1-indexed) to skip show-through removal, e.g. "1,4,7-9" '
+                             '(applies to every PDF in the batch)')
+    parser.add_argument('--bleed-bg-ksize', type=int, default=151,
+                        help='Show-through removal: background estimation kernel size (default: 151)')
+    parser.add_argument('--bleed-black-point', type=int, default=115,
+                        help='Show-through removal: values <= this become ink/black (default: 115)')
+    parser.add_argument('--bleed-white-point', type=int, default=205,
+                        help='Show-through removal: values >= this become paper/white; lower removes more (default: 205)')
+
+    # Margin whitening - clear the text-free outer margin bands (on by default).
+    # A band is cleared only if it touches a page edge and runs to the opposite
+    # edge without any text, so text can never be erased.
+    parser.add_argument('--no-margin-whitening', action='store_true',
+                        help='Disable whitening of the text-free outer margin bands')
+    parser.add_argument('--margin-pad', type=int, default=40,
+                        help='Margin whitening: pixels kept around the detected text extent (default: 40)')
+
     # OCR settings
     parser.add_argument('--ocr-lang', type=str, default='eng+jpn',
                         help='Tesseract language codes (default: eng+jpn)')
@@ -155,6 +176,15 @@ Examples:
             print(f"Error: invalid --deskew-exclude-pages: {e}", file=sys.stderr)
             sys.exit(1)
 
+    # Parse bleed-removal exclude pages
+    bleed_removal_exclude_pages = None
+    if args.bleed_removal_exclude_pages:
+        try:
+            bleed_removal_exclude_pages = parse_page_ranges(args.bleed_removal_exclude_pages)
+        except ValueError as e:
+            print(f"Error: invalid --bleed-removal-exclude-pages: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Build options
     options_kwargs = dict(
         margin_percent=args.margin_percent,
@@ -174,6 +204,13 @@ Examples:
         max_deskew_degree=args.max_deskew_degree,
         no_deskew=args.no_deskew,
         deskew_exclude_pages=deskew_exclude_pages,
+        no_bleed_removal=args.no_bleed_removal,
+        bleed_removal_exclude_pages=bleed_removal_exclude_pages,
+        bleed_bg_ksize=args.bleed_bg_ksize,
+        bleed_black_point=args.bleed_black_point,
+        bleed_white_point=args.bleed_white_point,
+        disable_margin_whitening=args.no_margin_whitening,
+        margin_pad=args.margin_pad,
     )
     if args.workers is not None:
         options_kwargs['max_workers'] = args.workers

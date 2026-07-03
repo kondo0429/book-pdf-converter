@@ -82,7 +82,7 @@ class PageBoundingBox:
 # =============================================================================
 # (A) Deskew - Rotation Correction
 # =============================================================================
-def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_percent: int = 40, denoise_strength: int = 20) -> float:
+def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_percent: int = 40, denoise_strength: int = 20, border_percent: float = 6.0) -> float:
     """
     Detect the deskew angle of a document image.
 
@@ -94,11 +94,24 @@ def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_pe
         max_degree: Maximum angle to correct (degrees), default 1.0 to match C#
         threshold_percent: Deskew threshold percent (default 40 to match C#)
         denoise_strength: Non-local means denoising strength (0 = disabled, default 20)
+        border_percent: Percentage of each edge to exclude from detection.
+                        Book scans often have dark spine shadows / page edges that
+                        binarize as long straight bars and dominate the Radon
+                        projection on sparse pages, yielding a wrong angle.
 
     Returns:
         Detected angle in degrees (0.0 if no rotation needed or detection failed)
     """
     from .image_processing_cy import GetDeskewAngle
+
+    # Crop borders so spine shadows / page edges don't drive the detection.
+    # Cropping does not change the skew angle of the remaining content.
+    if border_percent > 0:
+        h, w = image.shape[:2]
+        mx = int(w * border_percent / 100.0)
+        my = int(h * border_percent / 100.0)
+        if w - 2 * mx > 16 and h - 2 * my > 16:
+            image = image[my:h - my, mx:w - mx]
 
     # Apply non-local means denoising before contrast/grayscale (removes noise patterns)
     if denoise_strength > 0:
@@ -223,6 +236,165 @@ def deskew(image: np.ndarray, max_degree: float = 1.0, threshold_percent: int = 
 
     # Apply rotation to the main image
     return apply_deskew_rotation(image, angle)
+
+
+# =============================================================================
+# (A-2) Show-through / bleed-through removal (local flat-field + whitening)
+# =============================================================================
+def remove_show_through(
+    image: np.ndarray,
+    bg_ksize: int = 151,
+    black_point: int = 115,
+    white_point: int = 205,
+    gamma: float = 1.0,
+) -> np.ndarray:
+    """
+    Remove show-through (裏映り) text and non-uniform background color.
+
+    Unlike the global-linear ApplyGlobalColorAdjustment, this estimates the paper
+    background *locally* and flattens it, so uneven illumination and faint
+    reverse-side text are eliminated while foreground ink is preserved. The output
+    is grayscale replicated to 3 channels (RGB), suitable for text-heavy pages.
+
+    Steps:
+      1. Estimate paper background via morphological closing (removes dark text,
+         keeps illumination/paper) followed by a Gaussian blur.
+      2. Flat-field: divide the image by the background so paper -> ~255 everywhere.
+      3. Contrast stretch between black_point and white_point: values at/below
+         black_point map to 0 (ink), values at/above white_point map to 255
+         (paper + show-through, which is always lighter than real ink).
+
+    Args:
+        image: Input image (RGB format)
+        bg_ksize: Background estimation kernel size (odd). Must be larger than the
+                  thickest stroke / character spacing, or text gets eaten.
+        black_point: Values <= this (after flat-field) become pure ink (0).
+        white_point: Values >= this (after flat-field) become pure paper (255).
+                     Lower it to remove show-through more aggressively.
+        gamma: Optional gamma applied to the stretched result (1.0 = linear).
+
+    Returns:
+        Show-through-removed image (RGB, 3-channel grayscale)
+    """
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+
+    # 1) Estimate paper background (dark text closed out, illumination retained)
+    if bg_ksize % 2 == 0:
+        bg_ksize += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bg_ksize, bg_ksize))
+    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    bg = cv2.GaussianBlur(bg, (0, 0), bg_ksize / 6.0)
+
+    # 2) Flat-field division: paper -> ~255 uniformly across the page
+    norm = gray.astype(np.float32) / (bg.astype(np.float32) + 1e-3) * 255.0
+
+    # 3) Contrast stretch: ink -> 0, paper + show-through -> 255
+    denom = max(white_point - black_point, 1)
+    out = (norm - black_point) / denom
+    out = np.clip(out, 0.0, 1.0)
+    if gamma != 1.0:
+        out = out ** gamma
+    out = (out * 255.0).astype(np.uint8)
+
+    # Return as 3-channel RGB so downstream (bbox, crop, PDF) stays uniform
+    return cv2.cvtColor(out, cv2.COLOR_GRAY2RGB)
+
+
+# =============================================================================
+# (A-3) Margin background whitening (text-free bands touching the page edges)
+# =============================================================================
+def remove_margin_background(
+    image: np.ndarray,
+    stroke_threshold: int = 22,
+    ink_threshold: int = 145,
+    dens_win: int = 31,
+    dens_threshold: float = 0.015,
+    min_area_frac: float = 0.00005,
+    margin_pad: int = 40,
+    edge_exclude_frac: float = 0.10,
+    paper: int = 255,
+) -> np.ndarray:
+    """
+    Whiten the four outer margin bands that contain no text.
+
+    A band qualifies for deletion only if it touches a page edge and runs to
+    the opposite edge without any text: everything left of the leftmost text,
+    right of the rightmost text, above the topmost text, and below the
+    bottommost text. Anything sharing rows/columns with text (rules, figures,
+    dark junk between text columns) is never touched, so text that the
+    detector only partially finds can no longer be erased the way zone-based
+    clearing could.
+
+    Text is detected as dense sharp dark strokes (Laplacian response on dark
+    pixels). Spine shadows / page-edge streaks can have sharp outlines that
+    mimic strokes, so components lying entirely within the outer
+    edge_exclude_frac of the width are treated as edge junk, not text
+    (real text never sits at the extreme edge of the padded internal image).
+
+    Args:
+        image: Input image (RGB or grayscale)
+        stroke_threshold: Laplacian magnitude above which a dark pixel is a stroke.
+        ink_threshold: Pixels darker than this can count as stroke pixels.
+        dens_threshold: Min stroke density for a pixel to count as text
+                        (kept low so short/faint headers are still protected).
+        min_area_frac: Text components smaller than this fraction of the image
+                       are ignored (drops speckle, keeps small headers).
+        margin_pad: Extra pixels kept around the detected text extent.
+        edge_exclude_frac: Components fully inside the outer left/right strip of
+                           this width fraction never count as text.
+        paper: Replacement value (255 = white).
+
+    Returns:
+        Image with the text-free outer margin bands painted to paper.
+    """
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+
+    h, w = gray.shape
+    total = float(h * w)
+
+    # Text mask: dense sharp dark strokes (smooth shadows have low response)
+    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    stroke = ((lap > stroke_threshold) & (gray < ink_threshold)).astype(np.float32)
+    dens = cv2.boxFilter(stroke, -1, (dens_win, dens_win), normalize=True)
+    text = (dens > dens_threshold).astype(np.uint8)
+
+    # Drop tiny speckle components and edge-strip junk; keep anything that
+    # could be a header
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(text, 8)
+    strip = edge_exclude_frac * w
+    keep = np.zeros((h, w), dtype=bool)
+    for i in range(1, num):
+        x, y, bw, bh, area = stats[i]
+        if area < min_area_frac * total:
+            continue
+        # Fully inside the outer left/right strip -> edge junk, not text
+        if x + bw <= strip or x >= w - strip:
+            continue
+        keep |= (labels == i)
+
+    if not keep.any():
+        # No text found (blank or photo-only page misdetection) - do nothing
+        return image
+
+    rows = np.where(keep.any(axis=1))[0]
+    cols = np.where(keep.any(axis=0))[0]
+    top = max(0, int(rows[0]) - margin_pad)
+    bottom = min(h, int(rows[-1]) + 1 + margin_pad)
+    left = max(0, int(cols[0]) - margin_pad)
+    right = min(w, int(cols[-1]) + 1 + margin_pad)
+
+    out = image.copy()
+    out[:top] = paper
+    out[bottom:] = paper
+    out[:, :left] = paper
+    out[:, right:] = paper
+    return out
 
 
 # =============================================================================

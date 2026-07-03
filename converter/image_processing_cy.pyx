@@ -360,7 +360,10 @@ cdef class GlobalColorParam:
     cdef public uint8 WhiteClipRange
     cdef public uint8 PaperR, PaperG, PaperB
     cdef public uint8 SatThreshold
-    cdef public uint8 ColorDistThreshold
+    # int (not uint8): the paper-distance gate compares against a sum of three
+    # channel diffs (0-765), so values above 255 must be representable to
+    # effectively disable the gate for bleed-through removal.
+    cdef public int ColorDistThreshold
     cdef public float BleedHueMin, BleedHueMax, BleedValueMin
 
     def __init__(self):
@@ -874,7 +877,7 @@ def ApplyGlobalColorAdjustment(uint8[:,:,:] image, GlobalColorParam p):
     cdef double offsetG = p.OffsetG
     cdef double offsetB = p.OffsetB
     cdef uint8 satThreshold = p.SatThreshold
-    cdef uint8 colorDistThreshold = p.ColorDistThreshold
+    cdef int colorDistThreshold = p.ColorDistThreshold
 
     # C# lines 2409-2462
     with nogil:

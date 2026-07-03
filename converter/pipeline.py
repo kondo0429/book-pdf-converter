@@ -51,6 +51,8 @@ from .image_processing_cy import (
 # Import remaining functions from Python module (not yet ported to Cython)
 from .image_processing import (
     deskew,
+    remove_show_through,
+    remove_margin_background,
 )
 
 from .ocr import (
@@ -130,6 +132,29 @@ class ConversionOptions:
 
     # Physical page numbers (1-indexed) to skip deskew for (None = deskew all)
     deskew_exclude_pages: Optional[Set[int]] = None
+
+    # Show-through (裏映り) removal via local flat-field + whitening runs on ALL
+    # pages by default (grayscale output — intended for text-heavy books).
+    # It replaces the global color adjustment on those pages: the paper
+    # background is estimated locally and flattened to white, which removes
+    # both show-through text and non-uniform background color.
+    # Disable it entirely with no_bleed_removal, or list 1-indexed pages to
+    # exclude; excluded pages keep the standard global color adjustment
+    # (e.g. color/photo pages that would otherwise be desaturated).
+    no_bleed_removal: bool = False
+    bleed_removal_exclude_pages: Optional[Set[int]] = None
+    # Tuning for show-through removal (see remove_show_through).
+    bleed_bg_ksize: int = 151
+    bleed_black_point: int = 115
+    bleed_white_point: int = 205
+
+    # Whiten the four outer margin bands that contain no text (see
+    # remove_margin_background). A band is cleared only if it touches a page
+    # edge and runs to the opposite edge without any text, so partially
+    # detected text can never be erased. Runs on all pages by default,
+    # after color/show-through adjustment.
+    disable_margin_whitening: bool = False
+    margin_pad: int = 40
 
 
 @dataclass
@@ -515,10 +540,34 @@ def _perform_pages_yohaku(
         img_bgr = cv2.imread(page.deskew_file_path)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Apply color adjustment (Cython with nogil - modifies in-place)
-        color_param = odd_color_param if page.is_odd else even_color_param
-        adjusted = np.ascontiguousarray(img_rgb)
-        ApplyGlobalColorAdjustment(adjusted, color_param)
+        # Show-through removal runs on all pages by default; skip if globally
+        # disabled or this page is excluded (excluded pages keep the standard
+        # global color adjustment).
+        bleed_exclude = options.bleed_removal_exclude_pages or set()
+        apply_bleed = not options.no_bleed_removal and page.page_number not in bleed_exclude
+        if apply_bleed:
+            adjusted = remove_show_through(
+                img_rgb,
+                bg_ksize=options.bleed_bg_ksize,
+                black_point=options.bleed_black_point,
+                white_point=options.bleed_white_point,
+            )
+            adjusted = np.ascontiguousarray(adjusted)
+        else:
+            # Apply color adjustment (Cython with nogil - modifies in-place)
+            color_param = odd_color_param if page.is_odd else even_color_param
+            adjusted = np.ascontiguousarray(img_rgb)
+            ApplyGlobalColorAdjustment(adjusted, color_param)
+
+        # Whiten the text-free outer margin bands (before bbox so the crop
+        # isn't pulled toward edge junk / spine shadows)
+        if not options.disable_margin_whitening:
+            adjusted = np.ascontiguousarray(
+                remove_margin_background(
+                    adjusted,
+                    margin_pad=options.margin_pad,
+                )
+            )
 
         # Save color-adjusted image
         color_adj_path = os.path.join(tmp_dir, f"coloradj_{page.page_number:04d}.png")

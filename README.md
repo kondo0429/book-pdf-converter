@@ -150,6 +150,18 @@ book-pdf-converter input.pdf output.pdf --deskew-exclude-pages 1,4,7-9
 # Disable deskew for all pages
 book-pdf-converter input.pdf output.pdf --no-deskew
 
+# Show-through (bleed-through) & background removal is ON by default (grayscale output).
+# Exclude color/photo pages (they keep standard color adjustment) or disable globally
+book-pdf-converter input.pdf output.pdf --bleed-removal-exclude-pages 5,12-14
+book-pdf-converter input.pdf output.pdf --no-bleed-removal
+
+# Tune show-through removal (lower white point = stronger whitening)
+book-pdf-converter input.pdf output.pdf --bleed-white-point 195
+
+# Margin whitening: clears the text-free outer margin bands (ON by default)
+book-pdf-converter input.pdf output.pdf --no-margin-whitening
+book-pdf-converter input.pdf output.pdf --margin-pad 60
+
 ```
 
 ### Full Options Reference
@@ -161,6 +173,8 @@ usage: book-pdf-converter [-h] [--model MODEL] [--scale SCALE] [--tile TILE]
                      [--bypass-last] [--denoise-strength DENOISE_STRENGTH]
                      [--max-deskew-degree MAX_DESKEW_DEGREE] [--no-deskew]
                      [--deskew-exclude-pages DESKEW_EXCLUDE_PAGES]
+                     [--no-bleed-removal]
+                     [--bleed-removal-exclude-pages BLEED_REMOVAL_EXCLUDE_PAGES]
                      [--ocr-lang OCR_LANG]
                      [--pdf-format {jpeg,png}] [--jpeg-quality JPEG_QUALITY]
                      [--max-pages MAX_PAGES] [--keep-temp] [--quiet]
@@ -187,6 +201,22 @@ Options:
   --no-deskew           Disable deskew for all pages
   --deskew-exclude-pages PAGES
                         Page numbers (1-indexed) to skip deskew, e.g. "1,4,7-9"
+  --no-bleed-removal    Disable show-through/background removal for all pages
+                        (enabled by default; output is grayscale)
+  --bleed-removal-exclude-pages PAGES
+                        Page numbers (1-indexed) to skip show-through removal,
+                        e.g. "1,4,7-9" (excluded pages keep standard color
+                        adjustment - use for color/photo pages)
+  --bleed-bg-ksize N    Show-through removal: background estimation kernel size
+                        (default: 151)
+  --bleed-black-point N Show-through removal: values <= this become ink/black
+                        (default: 115)
+  --bleed-white-point N Show-through removal: values >= this become paper/white;
+                        lower removes more (default: 205)
+  --no-margin-whitening
+                        Disable whitening of the text-free outer margin bands
+  --margin-pad N        Margin whitening: pixels kept around the detected text
+                        extent (default: 40)
   --ocr-lang LANG       Tesseract language codes (default: eng+jpn)
   --pdf-format FMT      Image format in PDF: jpeg or png (default: jpeg)
   --jpeg-quality N      JPEG quality 0-100 (default: 70)
@@ -204,6 +234,9 @@ This port faithfully reproduces the original C# implementation, with the followi
 |--------|-------------|
 | `--bypass-first/last` | Added option to skip deskew/color/crop for cover pages while still applying AI enhancement |
 | Deskew controls | Added `--max-deskew-degree` (default 10°, vs. the original's 1° acceptance limit), `--no-deskew`, and `--deskew-exclude-pages`. Note: the Radon-based detector can only measure up to ~7°, so angles beyond that cannot be corrected regardless of this setting |
+| Show-through & background removal | On by default: instead of the original's global-linear color adjustment, each page's paper background is estimated locally (morphological closing + blur), the image is flat-field normalized so paper becomes uniformly white, and a contrast stretch (`--bleed-black-point` / `--bleed-white-point`) maps ink to black and show-through to white. Removes reverse-side ghost text AND non-uniform background color; output is grayscale. Exclude color/photo pages with `--bleed-removal-exclude-pages` (they keep the original color adjustment) or disable with `--no-bleed-removal` |
+| Margin whitening | On by default: the four outer margin bands are painted white — everything left of the leftmost text, right of the rightmost text, above the topmost text, and below the bottommost text. A band is cleared only if it touches a page edge and runs to the opposite edge without any text, so text can never be erased; spine shadows and page-edge streaks are removed. Anything sharing rows/columns with text is left untouched. `--no-margin-whitening` / `--margin-pad` |
+| Deskew border exclusion | Angle detection ignores the outer 6% of each edge, so dark spine shadows / page edges (long straight bars) don't dominate the Radon projection on sparse pages and cause wrong-direction rotation |
 | PDF extraction resize omitted | C# resizes to A4 (2480×3508) at extraction, but both pipelines normalize to internal high-res (4960×7016), making initial resize redundant |
 | Deskew | C# uses ImageMagick external binary on high-res images. This port uses Radon transform ported to Cython, detecting angle on original extracted images with denoising, then applying rotation to high-res images |
 
