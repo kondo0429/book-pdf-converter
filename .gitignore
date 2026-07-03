@@ -39,3 +39,7 @@ CLAUDE.md
 
 # Reference (original C# code, not distributed)
 reference/
+
+# Local test files
+/o.pdf
+/s.pdf
