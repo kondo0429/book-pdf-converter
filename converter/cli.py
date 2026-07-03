@@ -20,7 +20,49 @@ from . import convert_pdf, ConversionOptions
 from .models import find_model
 
 
+def parse_page_ranges(spec: str) -> set[int]:
+    """Parse a page spec like "1,4,7-9" into a set of page numbers.
+
+    Accepts comma-separated single pages and inclusive ranges (start-end).
+    Raises ValueError on malformed input or non-positive page numbers.
+    """
+    pages: set[int] = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            start_s, end_s = part.split('-', 1)
+            start, end = int(start_s), int(end_s)
+            if start > end:
+                start, end = end, start
+            if start < 1:
+                raise ValueError(f"page numbers must be >= 1: '{part}'")
+            pages.update(range(start, end + 1))
+        else:
+            page = int(part)
+            if page < 1:
+                raise ValueError(f"page numbers must be >= 1: '{part}'")
+            pages.add(page)
+    return pages
+
+
+def reconfigure_stdio_utf8():
+    """Force stdout/stderr to UTF-8 so progress bars (e.g. '█') don't crash on
+    consoles with a legacy encoding such as cp932 (Japanese Windows).
+    Falls back silently if the streams don't support reconfigure().
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main():
+    reconfigure_stdio_utf8()
     parser = argparse.ArgumentParser(
         description="Convert and enhance scanned PDF documents (C# compatible)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -64,6 +106,12 @@ Examples:
     # Deskew preprocessing
     parser.add_argument('--denoise-strength', type=int, default=20,
                         help='Non-local means denoising strength for deskew (0=disabled, default: 20)')
+    parser.add_argument('--max-deskew-degree', type=float, default=10.0,
+                        help='Max deskew angle to correct in degrees; larger detections are ignored (default: 10)')
+    parser.add_argument('--no-deskew', action='store_true',
+                        help='Disable deskew for all pages')
+    parser.add_argument('--deskew-exclude-pages', type=str, default=None,
+                        help='Page numbers (1-indexed) to skip deskew, e.g. "1,4,7-9"')
 
     # OCR settings
     parser.add_argument('--ocr-lang', type=str, default='eng+jpn',
@@ -110,6 +158,15 @@ Examples:
             print("Continuing without enhancement...", file=sys.stderr)
             args.skip_enhancement = True
 
+    # Parse deskew exclude pages
+    deskew_exclude_pages = None
+    if args.deskew_exclude_pages:
+        try:
+            deskew_exclude_pages = parse_page_ranges(args.deskew_exclude_pages)
+        except ValueError as e:
+            print(f"Error: invalid --deskew-exclude-pages: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Build options
     options_kwargs = dict(
         margin_percent=args.margin_percent,
@@ -126,6 +183,9 @@ Examples:
         pdf_image_format=args.pdf_format,
         jpeg_quality=args.jpeg_quality,
         denoise_strength=args.denoise_strength,
+        max_deskew_degree=args.max_deskew_degree,
+        no_deskew=args.no_deskew,
+        deskew_exclude_pages=deskew_exclude_pages,
     )
     if args.workers is not None:
         options_kwargs['max_workers'] = args.workers

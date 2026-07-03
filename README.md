@@ -141,6 +141,15 @@ book-pdf-converter input.pdf output.pdf --model /path/to/model.pth
 # Adjust margin percentage (default: 7%)
 book-pdf-converter input.pdf output.pdf --margin-percent 5
 
+# Allow larger deskew correction (up to the given angle in degrees)
+book-pdf-converter input.pdf output.pdf --max-deskew-degree 10
+
+# Skip deskew for specific pages (1-indexed, ranges allowed)
+book-pdf-converter input.pdf output.pdf --deskew-exclude-pages 1,4,7-9
+
+# Disable deskew for all pages
+book-pdf-converter input.pdf output.pdf --no-deskew
+
 ```
 
 ### Full Options Reference
@@ -150,6 +159,8 @@ usage: book-pdf-converter [-h] [--model MODEL] [--scale SCALE] [--tile TILE]
                      [--skip-enhancement] [--dpi DPI]
                      [--margin-percent MARGIN_PERCENT] [--bypass-first]
                      [--bypass-last] [--denoise-strength DENOISE_STRENGTH]
+                     [--max-deskew-degree MAX_DESKEW_DEGREE] [--no-deskew]
+                     [--deskew-exclude-pages DESKEW_EXCLUDE_PAGES]
                      [--ocr-lang OCR_LANG]
                      [--pdf-format {jpeg,png}] [--jpeg-quality JPEG_QUALITY]
                      [--max-pages MAX_PAGES] [--keep-temp] [--quiet]
@@ -171,6 +182,11 @@ Options:
   --bypass-first        Skip processing first page (cover)
   --bypass-last         Skip processing last page (back cover)
   --denoise-strength N  Denoising strength for deskew (default: 20, 0 to disable)
+  --max-deskew-degree D Max deskew angle to correct in degrees; larger detections
+                        are ignored (default: 10)
+  --no-deskew           Disable deskew for all pages
+  --deskew-exclude-pages PAGES
+                        Page numbers (1-indexed) to skip deskew, e.g. "1,4,7-9"
   --ocr-lang LANG       Tesseract language codes (default: eng+jpn)
   --pdf-format FMT      Image format in PDF: jpeg or png (default: jpeg)
   --jpeg-quality N      JPEG quality 0-100 (default: 70)
@@ -187,6 +203,7 @@ This port faithfully reproduces the original C# implementation, with the followi
 | Change | Description |
 |--------|-------------|
 | `--bypass-first/last` | Added option to skip deskew/color/crop for cover pages while still applying AI enhancement |
+| Deskew controls | Added `--max-deskew-degree` (default 10°, vs. the original's 1° acceptance limit), `--no-deskew`, and `--deskew-exclude-pages`. Note: the Radon-based detector can only measure up to ~7°, so angles beyond that cannot be corrected regardless of this setting |
 | PDF extraction resize omitted | C# resizes to A4 (2480×3508) at extraction, but both pipelines normalize to internal high-res (4960×7016), making initial resize redundant |
 | Deskew | C# uses ImageMagick external binary on high-res images. This port uses Radon transform ported to Cython, detecting angle on original extracted images with denoising, then applying rotation to high-res images |
 

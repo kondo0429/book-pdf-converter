@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime
 
 from . import convert_pdf, ConversionOptions
+from .cli import parse_page_ranges, reconfigure_stdio_utf8
 from .models import find_model
 
 
@@ -31,6 +32,7 @@ def find_pdfs(input_dir: Path) -> list[Path]:
 
 
 def main():
+    reconfigure_stdio_utf8()
     parser = argparse.ArgumentParser(
         description="Batch convert PDF documents in a directory",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -79,6 +81,12 @@ Examples:
     # Deskew preprocessing
     parser.add_argument('--denoise-strength', type=int, default=20,
                         help='Non-local means denoising strength for deskew (default: 20)')
+    parser.add_argument('--max-deskew-degree', type=float, default=10.0,
+                        help='Max deskew angle to correct in degrees; larger detections are ignored (default: 10)')
+    parser.add_argument('--no-deskew', action='store_true',
+                        help='Disable deskew for all pages')
+    parser.add_argument('--deskew-exclude-pages', type=str, default=None,
+                        help='Page numbers (1-indexed) to skip deskew, e.g. "1,4,7-9"')
 
     # OCR settings
     parser.add_argument('--ocr-lang', type=str, default='eng+jpn',
@@ -138,6 +146,15 @@ Examples:
             print("Continuing without enhancement...", file=sys.stderr)
             args.skip_enhancement = True
 
+    # Parse deskew exclude pages
+    deskew_exclude_pages = None
+    if args.deskew_exclude_pages:
+        try:
+            deskew_exclude_pages = parse_page_ranges(args.deskew_exclude_pages)
+        except ValueError as e:
+            print(f"Error: invalid --deskew-exclude-pages: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Build options
     options_kwargs = dict(
         margin_percent=args.margin_percent,
@@ -154,6 +171,9 @@ Examples:
         pdf_image_format=args.pdf_format,
         jpeg_quality=args.jpeg_quality,
         denoise_strength=args.denoise_strength,
+        max_deskew_degree=args.max_deskew_degree,
+        no_deskew=args.no_deskew,
+        deskew_exclude_pages=deskew_exclude_pages,
     )
     if args.workers is not None:
         options_kwargs['max_workers'] = args.workers

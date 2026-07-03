@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, List, Tuple
+from typing import Optional, Callable, List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import cv2
@@ -118,6 +118,18 @@ class ConversionOptions:
 
     # Non-local means denoising strength for deskew preprocessing (0 = disabled)
     denoise_strength: int = 20
+
+    # Maximum deskew angle to correct (degrees). Detected angles larger than this
+    # are treated as detection errors and ignored (page left unrotated).
+    # Note: the Radon-based detector can only measure up to ~7 degrees, so values
+    # above that mainly widen the accepted range up to that physical limit.
+    max_deskew_degree: float = 10.0
+
+    # Disable deskew entirely for all pages
+    no_deskew: bool = False
+
+    # Physical page numbers (1-indexed) to skip deskew for (None = deskew all)
+    deskew_exclude_pages: Optional[Set[int]] = None
 
 
 @dataclass
@@ -439,8 +451,18 @@ def _perform_pages_yohaku(
 
         # Deskew (Python - uses OpenCV which releases GIL internally)
         # Use original extracted image for angle detection (lower res, faster),
-        # then apply rotation to the resized high-res image
-        deskewed = deskew(resized, denoise_strength=options.denoise_strength, angle_source=img_rgb)
+        # then apply rotation to the resized high-res image.
+        # Skip when deskew is disabled globally or this page is excluded.
+        exclude_pages = options.deskew_exclude_pages or set()
+        if options.no_deskew or page.page_number in exclude_pages:
+            deskewed = resized
+        else:
+            deskewed = deskew(
+                resized,
+                max_degree=options.max_deskew_degree,
+                denoise_strength=options.denoise_strength,
+                angle_source=img_rgb,
+            )
 
         # Save deskewed image to tmp
         deskew_path = os.path.join(tmp_dir, f"deskew_{page.page_number:04d}.png")

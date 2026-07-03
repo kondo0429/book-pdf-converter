@@ -142,6 +142,15 @@ book-pdf-converter input.pdf output.pdf --model /path/to/model.pth
 # 余白のパーセンテージを調整（デフォルト: 7%）
 book-pdf-converter input.pdf output.pdf --margin-percent 5
 
+# 傾き補正の許容角度を広げる（指定した角度まで補正、単位: 度）
+book-pdf-converter input.pdf output.pdf --max-deskew-degree 10
+
+# 特定ページの傾き補正をスキップ（1始まり、範囲指定可）
+book-pdf-converter input.pdf output.pdf --deskew-exclude-pages 1,4,7-9
+
+# 全ページの傾き補正を無効化
+book-pdf-converter input.pdf output.pdf --no-deskew
+
 ```
 
 ### 全オプションリファレンス
@@ -151,6 +160,8 @@ usage: book-pdf-converter [-h] [--model MODEL] [--scale SCALE] [--tile TILE]
                      [--skip-enhancement] [--dpi DPI]
                      [--margin-percent MARGIN_PERCENT] [--bypass-first]
                      [--bypass-last] [--denoise-strength DENOISE_STRENGTH]
+                     [--max-deskew-degree MAX_DESKEW_DEGREE] [--no-deskew]
+                     [--deskew-exclude-pages DESKEW_EXCLUDE_PAGES]
                      [--ocr-lang OCR_LANG]
                      [--pdf-format {jpeg,png}] [--jpeg-quality JPEG_QUALITY]
                      [--max-pages MAX_PAGES] [--keep-temp] [--quiet]
@@ -172,6 +183,11 @@ usage: book-pdf-converter [-h] [--model MODEL] [--scale SCALE] [--tile TILE]
   --bypass-first        最初のページ（表紙）の処理をスキップ
   --bypass-last         最後のページ（裏表紙）の処理をスキップ
   --denoise-strength N  傾き補正用ノイズ除去強度（デフォルト: 20、0で無効）
+  --max-deskew-degree D 補正する傾きの最大角度（度）。これを超える検出値は無視
+                        （デフォルト: 10）
+  --no-deskew           全ページの傾き補正を無効化
+  --deskew-exclude-pages PAGES
+                        傾き補正をスキップするページ番号（1始まり）例: "1,4,7-9"
   --ocr-lang LANG       Tesseractの言語コード（デフォルト: eng+jpn）
   --pdf-format FMT      PDF内の画像形式: jpegまたはpng（デフォルト: jpeg）
   --jpeg-quality N      JPEG品質 0-100（デフォルト: 70）
@@ -188,6 +204,7 @@ usage: book-pdf-converter [-h] [--model MODEL] [--scale SCALE] [--tile TILE]
 | 変更点 | 説明 |
 |--------|------|
 | `--bypass-first/last` | 表紙ページの傾き補正/色調整/クロップをスキップしつつ、AI鮮明化は適用するオプションを追加 |
+| 傾き補正の制御 | `--max-deskew-degree`（デフォルト10°、本家の許容上限1°から拡大）、`--no-deskew`、`--deskew-exclude-pages` を追加。なお、Radon変換ベースの角度検出は約7°までしか測定できないため、これを超える傾きは設定に関わらず補正できません |
 | PDF抽出時のリサイズ省略 | C#は抽出時にA4サイズ（2480×3508）にリサイズするが、両パイプラインとも内部高解像度（4960×7016）に正規化するため省略 |
 | 傾き補正 | C#はImageMagick外部バイナリで高解像度画像に対して処理。本移植版はRadon変換をCythonに移植し、元の抽出画像でノイズ除去後に角度検出、高解像度画像に回転を適用 |
 
