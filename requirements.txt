@@ -1,0 +1,15 @@
+# PDF Converter - Python Reimplementation
+# Core dependencies
+pymupdf>=1.23.0          # PDF reading/writing (fitz)
+numpy>=1.24.0
+opencv-python>=4.8.0     # Image processing
+Pillow>=10.0.0           # Image handling
+pytesseract>=0.3.10
+
+# AI Enhancement
+# For Mac: use CoreML for inference, torch for model conversion
+# For Linux/Windows: use PyTorch + spandrel
+torch>=2.0.0
+coremltools>=7.0; sys_platform == 'darwin'
+spandrel>=0.1.0; sys_platform != 'darwin'
+

@@ -1,0 +1,14 @@
+# This directory is for model files.
+# Models are not included in git but are bundled when you run pip install.
+#
+# To set up:
+# 1. Download RealESRGAN_x4plus.pth from:
+#    https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+#
+# 2. On Mac, convert to CoreML:
+#    python scripts/setup_model.py
+#
+# 3. Install the package:
+#    pip install .
+#
+# The model will be bundled and auto-detected.
