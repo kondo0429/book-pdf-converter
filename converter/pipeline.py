@@ -420,29 +420,36 @@ def convert_pdf(
 
 
 def convert_images(
-    input_dir: str | Path,
+    input_dir: str | Path | None,
     output_dir: str | Path,
     options: Optional[ConversionOptions] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    input_files: Optional[List[str | Path]] = None,
 ) -> ConversionResult:
     """
-    Convert a folder of scanned JPEG pages with the same processing pipeline
-    as convert_pdf (crop, enhancement, deskew, color/show-through, margin
+    Convert scanned JPEG pages with the same processing pipeline as
+    convert_pdf (crop, enhancement, deskew, color/show-through, margin
     whitening, crop unification, OCR alignment), writing one processed JPEG
     per input file under the same name.
 
     Input files are expected to be numbered like 000.JPG, 001.JPG, ... in
     ascending order. Gaps in the numbering are allowed: the file number is
     used as the physical page number, so the odd/even (left/right page)
-    grouping stays aligned across gaps.
+    grouping stays aligned across gaps - this also means an explicit subset
+    of files keeps the correct grouping (071.JPG stays an even/left page even
+    when processed alone).
 
     Args:
-        input_dir: Folder containing the input JPEG files
+        input_dir: Folder containing the input JPEG files. May be None when
+                   input_files is given.
         output_dir: Folder to write the processed JPEG files to (created if
                     missing); each output keeps its input's file name
         options: Conversion options (pdf_image_format is ignored;
                  jpeg_quality controls the output JPEG quality)
         progress_callback: Callback for progress updates (current, total, message)
+        input_files: Explicit list of JPEG file paths to process instead of
+                     scanning input_dir. May span multiple folders; files are
+                     ordered by file name. Takes precedence over input_dir.
 
     Returns:
         ConversionResult with metadata (output_path is the output folder)
@@ -450,11 +457,7 @@ def convert_images(
     if options is None:
         options = ConversionOptions()
 
-    input_dir = Path(input_dir)
     output_dir = Path(output_dir)
-
-    if not input_dir.is_dir():
-        raise FileNotFoundError(f"Input folder not found: {input_dir}")
 
     def report(current: int, total: int, message: str):
         if progress_callback:
@@ -465,22 +468,45 @@ def convert_images(
             else:
                 print(f"[{current}/{total}] {message}")
 
-    # Collect input JPEGs (ascending file-name order)
-    src_names = sorted(
-        f for f in os.listdir(input_dir)
-        if os.path.splitext(f)[1].lower() in ('.jpg', '.jpeg')
-    )
-    if not src_names:
-        raise FileNotFoundError(f"No JPEG files found in: {input_dir}")
+    # Collect input JPEG paths (ascending file-name order)
+    if input_files:
+        src_paths = [Path(f) for f in input_files]
+        missing = [str(p) for p in src_paths if not p.is_file()]
+        if missing:
+            raise FileNotFoundError("Input file(s) not found: " + ", ".join(missing))
+        src_paths = [p for p in src_paths if p.suffix.lower() in ('.jpg', '.jpeg')]
+        if not src_paths:
+            raise FileNotFoundError("No JPEG files in the given file list")
+        src_paths = sorted(src_paths, key=lambda p: p.name)
+    else:
+        if input_dir is None:
+            raise ValueError("Either input_dir or input_files must be provided")
+        input_dir = Path(input_dir)
+        if not input_dir.is_dir():
+            raise FileNotFoundError(f"Input folder not found: {input_dir}")
+        src_paths = sorted(
+            (input_dir / f for f in os.listdir(input_dir)
+             if os.path.splitext(f)[1].lower() in ('.jpg', '.jpeg')),
+            key=lambda p: p.name,
+        )
+        if not src_paths:
+            raise FileNotFoundError(f"No JPEG files found in: {input_dir}")
 
     if options.max_pages:
-        src_names = src_names[:options.max_pages]
-    total_pages = len(src_names)
+        src_paths = src_paths[:options.max_pages]
+    # Output file names (basenames); a repeated basename across folders would
+    # overwrite, so warn the caller rather than silently clobbering.
+    src_names = [p.name for p in src_paths]
+    dupes = {n for n in src_names if src_names.count(n) > 1}
+    if dupes:
+        report(0, 0, "WARNING: duplicate input file names will overwrite each "
+                     "other in the output: " + ", ".join(sorted(dupes)))
+    total_pages = len(src_paths)
 
     # Page numbers from the numeric file stems (000.JPG -> page 1), so gaps
     # keep the odd/even alternation. Falls back to sequential numbering when
     # any stem is not a plain number.
-    stems = [os.path.splitext(f)[0] for f in src_names]
+    stems = [p.stem for p in src_paths]
     if all(s.isdigit() for s in stems):
         page_numbers = [int(s) + 1 for s in stems]
     else:
@@ -503,10 +529,10 @@ def convert_images(
         # =====================================================================
         report(0, total_pages, "Step 1: Loading and cropping scan margins...")
 
-        for idx, (name, num) in enumerate(zip(src_names, page_numbers)):
-            image = cv2.imread(str(input_dir / name))
+        for idx, (src_path, num) in enumerate(zip(src_paths, page_numbers)):
+            image = cv2.imread(str(src_path))
             if image is None:
-                raise IOError(f"Cannot read image: {input_dir / name}")
+                raise IOError(f"Cannot read image: {src_path}")
             h, w = image.shape[:2]
 
             if w >= 10 and h >= 10:
@@ -516,7 +542,7 @@ def convert_images(
 
             out_path = os.path.join(img_cropped_dir, f"page_{num:04d}.png")
             cv2.imwrite(out_path, image)
-            report(idx + 1, total_pages, f"Cropping {name}")
+            report(idx + 1, total_pages, f"Cropping {src_path.name}")
 
         # =====================================================================
         # STEP 2: AI Enhancement (Real-ESRGAN)

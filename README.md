@@ -139,7 +139,13 @@ book-jpeg-converter input_dir/ output_dir/
 
 # Skip AI enhancement
 book-jpeg-converter input_dir/ output_dir/ --skip-enhancement
+
+# Process specific file(s) instead of a whole folder (--files / -f).
+# The folder argument is omitted; only the output folder is given.
+book-jpeg-converter output_dir/ --files scans/003.JPG scans/071.JPG
 ```
+
+With `--files` you can process a specific subset of pages (one or more paths, which may span folders). Because the page number comes from the file number, a subset still keeps the correct left/right grouping (e.g. `071.JPG` stays an even/left page even when processed alone).
 
 `book-jpeg-converter` supports the same processing options as `book-pdf-converter` (deskew, show-through removal, margin whitening, exclusion lists — page 1 corresponds to `000.JPG`), except the PDF-specific ones (`--dpi`, `--pdf-format`); `--jpeg-quality` controls the output file quality (default: 70).
 

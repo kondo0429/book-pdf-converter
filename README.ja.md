@@ -140,7 +140,13 @@ book-jpeg-converter input_dir/ output_dir/
 
 # AI鮮明化をスキップ
 book-jpeg-converter input_dir/ output_dir/ --skip-enhancement
+
+# フォルダ全体ではなく特定のファイルだけを処理（--files / -f）。
+# フォルダ引数は省略し、出力フォルダのみを指定します。
+book-jpeg-converter output_dir/ --files scans/003.JPG scans/071.JPG
 ```
+
+`--files` で特定ページだけを処理できます（1つ以上のパス。複数フォルダにまたがっても可）。ページ番号はファイル番号から決まるため、一部のファイルだけを処理しても左右ページのグループ分けは正しく保たれます（例: `071.JPG` は単独で処理しても偶数/左ページのまま）。
 
 `book-jpeg-converter` は `book-pdf-converter` と同じ処理オプション（傾き補正、裏映り除去、余白白色化、除外ページ指定 — ページ1が `000.JPG` に対応）が使えます。PDF固有のオプション（`--dpi`、`--pdf-format`）はありません。`--jpeg-quality` は出力ファイルの品質を指定します（デフォルト: 70）。
 

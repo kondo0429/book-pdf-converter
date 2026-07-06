@@ -13,6 +13,7 @@ grouping aligned). Each output JPEG keeps its input's file name.
 Usage:
     book-jpeg-converter input_dir/ output_dir/
     book-jpeg-converter input_dir/ output_dir/ --skip-enhancement
+    book-jpeg-converter output_dir/ --files 003.JPG 071.JPG
 """
 
 import argparse
@@ -37,12 +38,19 @@ Examples:
   book-jpeg-converter scans/ cleaned/                # auto-detect bundled model
   book-jpeg-converter scans/ cleaned/ --skip-enhancement
   book-jpeg-converter scans/ cleaned/ --bleed-removal-exclude-pages 1,5
+  book-jpeg-converter cleaned/ --files scans/003.JPG scans/071.JPG
         """,
     )
 
-    # Input/Output folders
-    parser.add_argument('input_dir', type=str, help='Folder containing input JPEG files (000.JPG, 001.JPG, ...)')
+    # Input/Output. input_dir is optional when --files is used.
+    parser.add_argument('input_dir', type=str, nargs='?', default=None,
+                        help='Folder containing input JPEG files (000.JPG, 001.JPG, ...). '
+                             'Omit when using --files.')
     parser.add_argument('output_dir', type=str, help='Folder for processed JPEG files (same names as input)')
+    parser.add_argument('--files', '-f', nargs='+', metavar='FILE', default=None,
+                        help='Process these specific JPEG file(s) instead of scanning a folder. '
+                             'Accepts multiple paths (may span folders). File numbers still set '
+                             'the page number, so a subset keeps the correct left/right grouping.')
 
     # Enhancement options
     parser.add_argument('--model', '-m', type=str, default=None,
@@ -118,11 +126,20 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate input folder
-    input_dir = Path(args.input_dir)
-    if not input_dir.is_dir():
-        print(f"Error: Input folder not found: {input_dir}", file=sys.stderr)
-        sys.exit(1)
+    # Validate input: either --files or an input folder (not neither)
+    if args.files:
+        missing = [f for f in args.files if not Path(f).is_file()]
+        if missing:
+            print(f"Error: Input file(s) not found: {', '.join(missing)}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if args.input_dir is None:
+            print("Error: provide an input folder or use --files", file=sys.stderr)
+            sys.exit(1)
+        input_dir = Path(args.input_dir)
+        if not input_dir.is_dir():
+            print(f"Error: Input folder not found: {input_dir}", file=sys.stderr)
+            sys.exit(1)
 
     # Auto-detect model if not specified
     if not args.skip_enhancement and not args.model:
@@ -231,7 +248,8 @@ Examples:
     # Run conversion
     try:
         start_time = datetime.now()
-        result = convert_images(args.input_dir, args.output_dir, options, progress)
+        result = convert_images(args.input_dir, args.output_dir, options, progress,
+                                input_files=args.files)
         elapsed = datetime.now() - start_time
 
         if not args.quiet:
@@ -245,8 +263,12 @@ Examples:
             else:
                 elapsed_str = f"{elapsed.total_seconds():.1f}s"
 
+            if args.files:
+                input_desc = f"{len(args.files)} file(s)"
+            else:
+                input_desc = args.input_dir
             print(f"\nConversion complete!")
-            print(f"  Input:  {args.input_dir}")
+            print(f"  Input:  {input_desc}")
             print(f"  Output: {result.output_path}")
             print(f"  Time:   {elapsed_str}")
             print(f"  Pages:  {result.processed_pages}/{result.total_pages}")
