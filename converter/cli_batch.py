@@ -128,6 +128,9 @@ Examples:
     # Other
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress progress output')
+    parser.add_argument('--debug', nargs='?', const='', default=None, metavar='FILE',
+                        help='Print per-page debug output (detections and applied processing); '
+                             'give FILE to write it to a file instead of the console')
     parser.add_argument('--workers', type=int, default=None,
                         help='Number of parallel workers (default: number of CPUs)')
 
@@ -211,9 +214,19 @@ Examples:
         bleed_white_point=args.bleed_white_point,
         disable_margin_whitening=args.no_margin_whitening,
         margin_pad=args.margin_pad,
+        debug=args.debug is not None,
+        debug_log_path=args.debug or None,
     )
     if args.workers is not None:
         options_kwargs['max_workers'] = args.workers
+    # Truncate/create the debug log file at startup (the pipeline appends)
+    if args.debug:
+        try:
+            open(args.debug, 'w', encoding='utf-8').close()
+        except OSError as e:
+            print(f"Error: cannot write debug log {args.debug}: {e}", file=sys.stderr)
+            sys.exit(1)
+
     options = ConversionOptions(**options_kwargs)
 
     # Process PDFs

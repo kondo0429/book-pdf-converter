@@ -22,6 +22,7 @@ dependencies = [
 [project.scripts]
 book-pdf-converter = "converter.cli:main"
 book-pdf-converter-batch = "converter.cli_batch:main"
+book-jpeg-converter = "converter.cli_jpeg:main"
 
 [tool.setuptools]
 packages = ["converter", "converter.models"]

@@ -12,7 +12,7 @@ This is a faithful reimplementation of SuperPdfUtil.cs including:
 - OCR page number detection
 """
 
-from .pipeline import convert_pdf, ConversionOptions, ConversionResult
+from .pipeline import convert_pdf, convert_images, ConversionOptions, ConversionResult
 from .pdf_reader import extract_pages, get_page_count, crop_margins
 from .pdf_writer import build_pdf
 from .enhancer import enhance_image, create_enhancer
@@ -41,6 +41,7 @@ __version__ = "1.0.0"
 __all__ = [
     # Main API
     "convert_pdf",
+    "convert_images",
     "ConversionOptions",
     "ConversionResult",
     # PDF I/O

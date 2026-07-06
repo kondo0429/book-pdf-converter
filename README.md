@@ -129,6 +129,20 @@ book-pdf-converter-batch input_dir/ output_dir/ --continue-on-error
 
 `book-pdf-converter-batch` supports the same options as `book-pdf-converter`, plus `--skip-existing` and `--continue-on-error`.
 
+### JPEG Folder Processing
+
+Apply the same processing pipeline to a folder of scanned JPEG pages instead of a PDF. Input files are expected to be numbered like `000.JPG, 001.JPG, ...` in ascending order; gaps in the numbering are allowed (the file number keeps the odd/even page grouping aligned). Each output JPEG keeps its input's file name.
+
+```bash
+# Process all JPEGs in a folder
+book-jpeg-converter input_dir/ output_dir/
+
+# Skip AI enhancement
+book-jpeg-converter input_dir/ output_dir/ --skip-enhancement
+```
+
+`book-jpeg-converter` supports the same processing options as `book-pdf-converter` (deskew, show-through removal, margin whitening, exclusion lists — page 1 corresponds to `000.JPG`), except the PDF-specific ones (`--dpi`, `--pdf-format`); `--jpeg-quality` controls the output file quality (default: 70).
+
 ### Advanced Options
 
 ```bash
@@ -223,6 +237,9 @@ Options:
   --max-pages N         Maximum pages to process (for testing)
   --keep-temp           Keep temporary directory
   --quiet, -q           Suppress progress output
+  --debug [FILE]        Print per-page debug output (what was detected and
+                        which processing was applied on each page); give FILE
+                        to write it to a file instead of the console
   --workers N           Number of parallel workers
 ```
 
@@ -235,8 +252,8 @@ This port faithfully reproduces the original C# implementation, with the followi
 | `--bypass-first/last` | Added option to skip deskew/color/crop for cover pages while still applying AI enhancement |
 | Deskew controls | Added `--max-deskew-degree` (default 10°, vs. the original's 1° acceptance limit), `--no-deskew`, and `--deskew-exclude-pages`. Note: the Radon-based detector can only measure up to ~7°, so angles beyond that cannot be corrected regardless of this setting |
 | Show-through & background removal | On by default: instead of the original's global-linear color adjustment, each page's paper background is estimated locally (morphological closing + blur), the image is flat-field normalized so paper becomes uniformly white, and a contrast stretch (`--bleed-black-point` / `--bleed-white-point`) maps ink to black and show-through to white. Removes reverse-side ghost text AND non-uniform background color; output is grayscale. Exclude color/photo pages with `--bleed-removal-exclude-pages` (they keep the original color adjustment) or disable with `--no-bleed-removal` |
-| Margin whitening | On by default: the four outer margin bands are painted white — everything left of the leftmost text, right of the rightmost text, above the topmost text, and below the bottommost text. A band is cleared only if it touches a page edge and runs to the opposite edge without any text, so text can never be erased; spine shadows and page-edge streaks are removed. Anything sharing rows/columns with text is left untouched. `--no-margin-whitening` / `--margin-pad` |
-| Deskew border exclusion | Angle detection ignores the outer 6% of each edge, so dark spine shadows / page edges (long straight bars) don't dominate the Radon projection on sparse pages and cause wrong-direction rotation |
+| Margin whitening | On by default: the four outer margin bands are painted white — everything left of the leftmost text, right of the rightmost text, above the topmost text, and below the bottommost text. A band is cleared only if it touches a page edge and runs to the opposite edge without any text, so text can never be erased; spine shadows and page-edge streaks are removed. Anything sharing rows/columns with text is left untouched. Scan junk that must not block the bands is detected on the pre-adjustment image and excluded from the text detection: dark regions touching the image border (photography stand / scan bed) and thin continuous dark bars (page-edge / fold shadow lines) - both physically impossible for print, and photos are unaffected. The median cleared band width on each side is then re-granted as page margins around the final crop (replacing `--margin-percent` in this mode), and the same top/bottom margins are shared by odd and even pages so their text starts at the same height. `--no-margin-whitening` / `--margin-pad` |
+| Deskew border exclusion | Angle detection ignores the outer 6% of the left/right edges and 10% of the top/bottom edges. The horizontal exclusion keeps dark spine shadows / page edges (long straight bars) from dominating the Radon projection on sparse pages; the vertical exclusion keeps running titles / footers (long horizontal text lines that page curvature can leave level while the body is skewed) from masking the body skew |
 | PDF extraction resize omitted | C# resizes to A4 (2480×3508) at extraction, but both pipelines normalize to internal high-res (4960×7016), making initial resize redundant |
 | Deskew | C# uses ImageMagick external binary on high-res images. This port uses Radon transform ported to Cython, detecting angle on original extracted images with denoising, then applying rotation to high-res images |
 

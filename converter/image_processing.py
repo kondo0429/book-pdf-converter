@@ -82,7 +82,7 @@ class PageBoundingBox:
 # =============================================================================
 # (A) Deskew - Rotation Correction
 # =============================================================================
-def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_percent: int = 40, denoise_strength: int = 20, border_percent: float = 6.0) -> float:
+def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_percent: int = 40, denoise_strength: int = 20, border_percent: float = 6.0, vertical_border_percent: float = 10.0, raw_out: Optional[list] = None) -> float:
     """
     Detect the deskew angle of a document image.
 
@@ -94,22 +94,34 @@ def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_pe
         max_degree: Maximum angle to correct (degrees), default 1.0 to match C#
         threshold_percent: Deskew threshold percent (default 40 to match C#)
         denoise_strength: Non-local means denoising strength (0 = disabled, default 20)
-        border_percent: Percentage of each edge to exclude from detection.
-                        Book scans often have dark spine shadows / page edges that
-                        binarize as long straight bars and dominate the Radon
-                        projection on sparse pages, yielding a wrong angle.
+        border_percent: Percentage of the left/right edges to exclude from
+                        detection. Book scans often have dark spine shadows /
+                        page edges that binarize as long straight bars and
+                        dominate the Radon projection on sparse pages,
+                        yielding a wrong angle.
+        vertical_border_percent: Percentage of the top/bottom edges to exclude.
+                        Running titles / footers are long horizontal text lines
+                        that the Radon projection is highly sensitive to; page
+                        curvature can leave them level while the body is
+                        skewed, so they mask the body skew (detector reports
+                        ~0). They sit at the very top/bottom, so excluding 10%
+                        keeps the detection on the body text.
+        raw_out: Optional list; when given, the raw Radon angle (before the
+                 max_degree / near-zero checks and sign negation) is appended.
+                 Used for debug output.
 
     Returns:
         Detected angle in degrees (0.0 if no rotation needed or detection failed)
     """
     from .image_processing_cy import GetDeskewAngle
 
-    # Crop borders so spine shadows / page edges don't drive the detection.
-    # Cropping does not change the skew angle of the remaining content.
-    if border_percent > 0:
+    # Crop borders so spine shadows / page edges / running titles don't drive
+    # the detection. Cropping does not change the skew angle of the remaining
+    # content.
+    if border_percent > 0 or vertical_border_percent > 0:
         h, w = image.shape[:2]
         mx = int(w * border_percent / 100.0)
-        my = int(h * border_percent / 100.0)
+        my = int(h * vertical_border_percent / 100.0)
         if w - 2 * mx > 16 and h - 2 * my > 16:
             image = image[my:h - my, mx:w - mx]
 
@@ -150,6 +162,8 @@ def detect_deskew_angle(image: np.ndarray, max_degree: float = 1.0, threshold_pe
     # Use Cython port of ImageMagick's deskew angle detection (Radon transform)
     # The algorithm does its own binarization using threshold_percent
     angle = GetDeskewAngle(gray, threshold_percent / 100.0)
+    if raw_out is not None:
+        raw_out.append(angle)
 
     # C# lines 362-365: If angle exceeds max_degree, return 0 (no rotation)
     if abs(angle) > max_degree:
@@ -304,6 +318,87 @@ def remove_show_through(
 
 
 # =============================================================================
+# (A-2b) Page-edge junk detection (photography stand / page-edge shadows)
+# =============================================================================
+def detect_page_edge_junk(
+    image: np.ndarray,
+    border: int = 16,
+    min_area: int = 500,
+    run_frac: float = 0.08,
+    max_bar_thickness: int = 150,
+    dark_ratio: float = 0.8,
+) -> np.ndarray:
+    """
+    Detect scan junk (photography stand slabs, page-edge / fold shadow lines)
+    on the PRE-color-adjustment image, where they are still solid dark shapes.
+
+    The show-through flat-field neutralizes the interior of large dark slabs
+    into mottled texture that mimics text density, so junk must be located
+    BEFORE that step. Two rules, both physically impossible for print:
+    (1) dark regions touching the image border - the padded internal image
+        never has print at its border (photography stand / scan bed)
+    (2) thin continuous dark bars (>= run_frac of the image dimension long,
+        <= max_bar_thickness thick) - text always breaks between characters,
+        so such runs can't be text (page-edge / fold shadow lines).
+    Photos are safe: they don't touch the border and are thick in both
+    directions.
+
+    Args:
+        image: Deskewed page image BEFORE color adjustment (RGB or grayscale)
+        border: Border contact distance in px for rule (1)
+        min_area: Minimum component area for rule (1)
+        run_frac: Minimum continuous run length as a fraction of height/width
+        max_bar_thickness: Maximum thickness for rule (2) bars
+        dark_ratio: Pixels darker than paper * dark_ratio count as dark
+
+    Returns:
+        uint8 mask (1 = junk) in the same geometry as `image`
+    """
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    h, w = gray.shape
+
+    # Paper estimate from the page center (robust to edge junk; on photo pages
+    # it under-estimates, which only makes the junk rules more conservative)
+    paper = float(np.median(gray[int(h * 0.25):int(h * 0.75),
+                                 int(w * 0.35):int(w * 0.85)]))
+    dark_thr = max(60.0, paper * dark_ratio)
+    dark = (gray < dark_thr).astype(np.uint8)
+
+    junk = np.zeros((h, w), dtype=np.uint8)
+
+    # (1) border-connected dark regions
+    num, lab, st, _ = cv2.connectedComponentsWithStats(dark, 8)
+    for i in range(1, num):
+        x, y, bw, bh, area = st[i]
+        if area < min_area:
+            continue
+        if x < border or y < border or x + bw > w - border or y + bh > h - border:
+            junk[lab == i] = 1
+
+    # (2) thin continuous bars (vertical then horizontal)
+    run_v = max(int(h * run_frac), 1)
+    bars = cv2.dilate(cv2.erode(dark, np.ones((run_v, 1), np.uint8)),
+                      np.ones((run_v, 1), np.uint8))
+    num_v, lab_v, st_v, _ = cv2.connectedComponentsWithStats(bars, 8)
+    for i in range(1, num_v):
+        if st_v[i, cv2.CC_STAT_WIDTH] <= max_bar_thickness:
+            junk[lab_v == i] = 1
+
+    run_h = max(int(w * run_frac), 1)
+    bars = cv2.dilate(cv2.erode(dark, np.ones((1, run_h), np.uint8)),
+                      np.ones((1, run_h), np.uint8))
+    num_h, lab_h, st_h, _ = cv2.connectedComponentsWithStats(bars, 8)
+    for i in range(1, num_h):
+        if st_h[i, cv2.CC_STAT_HEIGHT] <= max_bar_thickness:
+            junk[lab_h == i] = 1
+
+    return junk
+
+
+# =============================================================================
 # (A-3) Margin background whitening (text-free bands touching the page edges)
 # =============================================================================
 def remove_margin_background(
@@ -316,7 +411,8 @@ def remove_margin_background(
     margin_pad: int = 40,
     edge_exclude_frac: float = 0.10,
     paper: int = 255,
-) -> np.ndarray:
+    junk_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
     """
     Whiten the four outer margin bands that contain no text.
 
@@ -346,9 +442,18 @@ def remove_margin_background(
         edge_exclude_frac: Components fully inside the outer left/right strip of
                            this width fraction never count as text.
         paper: Replacement value (255 = white).
+        junk_mask: Optional mask from detect_page_edge_junk() (computed on the
+                   PRE-adjustment image, same geometry): marked areas never
+                   count as text, so the margin bands extend over them.
 
     Returns:
-        Image with the text-free outer margin bands painted to paper.
+        Tuple of:
+        - Image with the text-free outer margin bands painted to paper.
+        - Text extent (left, top, right, bottom) including margin_pad — the
+          inner boundaries of the painted bands — or None when no text was
+          found (image returned unchanged). The band widths derived from this
+          extent tell the caller how much page-edge area was cleared, so
+          equivalent margins can be re-granted around the final crop.
     """
     if image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -378,9 +483,24 @@ def remove_margin_background(
             continue
         keep |= (labels == i)
 
+    # Junk detected on the PRE-adjustment image (see detect_page_edge_junk):
+    # photography-stand slabs and page-edge shadow lines must not count as
+    # text, or the margin bands stop at them and the junk survives. It has to
+    # be detected before the show-through flat-field (which turns solid slabs
+    # into mottled texture that mimics text density), so the caller passes the
+    # mask in.
+    if junk_mask is not None and junk_mask.any():
+        # Fatten past the box-filter halo so the stroke-density ring around a
+        # junk structure is removed from the text mask as well
+        fat = cv2.dilate(
+            junk_mask, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * dens_win + 1, 2 * dens_win + 1))
+        )
+        keep &= (fat == 0)
+
     if not keep.any():
         # No text found (blank or photo-only page misdetection) - do nothing
-        return image
+        return image, None
 
     rows = np.where(keep.any(axis=1))[0]
     cols = np.where(keep.any(axis=0))[0]
@@ -394,7 +514,7 @@ def remove_margin_background(
     out[bottom:] = paper
     out[:, :left] = paper
     out[:, right:] = paper
-    return out
+    return out, (left, top, right, bottom)
 
 
 # =============================================================================

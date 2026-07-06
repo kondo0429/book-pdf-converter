@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-PDF Converter CLI - Convert and enhance scanned PDF documents.
+JPEG Converter CLI - Convert and enhance a folder of scanned JPEG pages.
 
-Exact Python port of C# DN_SuperBook_PDF_Converter (SuperPdfUtil.cs).
+Applies the same processing pipeline as book-pdf-converter (crop, AI
+enhancement, deskew, show-through removal, margin whitening, crop
+unification, OCR alignment) to JPEG files instead of a PDF.
+
+Input files are expected to be numbered like 000.JPG, 001.JPG, ... in
+ascending order (gaps allowed - the file number keeps the odd/even page
+grouping aligned). Each output JPEG keeps its input's file name.
 
 Usage:
-    python -m converter.cli input.pdf output.pdf
-    python -m converter.cli input.pdf output.pdf --model model.mlpackage
-    python -m converter.cli input.pdf output.pdf --skip-enhancement
+    book-jpeg-converter input_dir/ output_dir/
+    book-jpeg-converter input_dir/ output_dir/ --skip-enhancement
 """
 
 import argparse
@@ -16,68 +21,28 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import convert_pdf, ConversionOptions
+from . import ConversionOptions
+from .pipeline import convert_images
+from .cli import parse_page_ranges, reconfigure_stdio_utf8
 from .models import find_model
-
-
-def parse_page_ranges(spec: str) -> set[int]:
-    """Parse a page spec like "1,4,7-9" into a set of page numbers.
-
-    Accepts comma-separated single pages and inclusive ranges (start-end).
-    Raises ValueError on malformed input or non-positive page numbers.
-    """
-    pages: set[int] = set()
-    for part in spec.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '-' in part:
-            start_s, end_s = part.split('-', 1)
-            start, end = int(start_s), int(end_s)
-            if start > end:
-                start, end = end, start
-            if start < 1:
-                raise ValueError(f"page numbers must be >= 1: '{part}'")
-            pages.update(range(start, end + 1))
-        else:
-            page = int(part)
-            if page < 1:
-                raise ValueError(f"page numbers must be >= 1: '{part}'")
-            pages.add(page)
-    return pages
-
-
-def reconfigure_stdio_utf8():
-    """Force stdout/stderr to UTF-8 so progress bars (e.g. '█') don't crash on
-    consoles with a legacy encoding such as cp932 (Japanese Windows).
-    Falls back silently if the streams don't support reconfigure().
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):
-                pass
 
 
 def main():
     reconfigure_stdio_utf8()
     parser = argparse.ArgumentParser(
-        description="Convert and enhance scanned PDF documents (C# compatible)",
+        description="Convert and enhance a folder of scanned JPEG pages",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m converter input.pdf output.pdf              # auto-detect bundled model
-  python -m converter input.pdf output.pdf --model model.mlpackage
-  python -m converter input.pdf output.pdf --skip-enhancement
-  python -m converter input.pdf output.pdf --bypass-first --bypass-last
+  book-jpeg-converter scans/ cleaned/                # auto-detect bundled model
+  book-jpeg-converter scans/ cleaned/ --skip-enhancement
+  book-jpeg-converter scans/ cleaned/ --bleed-removal-exclude-pages 1,5
         """,
     )
 
-    # Input/Output
-    parser.add_argument('input', type=str, help='Input PDF path')
-    parser.add_argument('output', type=str, help='Output PDF path')
+    # Input/Output folders
+    parser.add_argument('input_dir', type=str, help='Folder containing input JPEG files (000.JPG, 001.JPG, ...)')
+    parser.add_argument('output_dir', type=str, help='Folder for processed JPEG files (same names as input)')
 
     # Enhancement options
     parser.add_argument('--model', '-m', type=str, default=None,
@@ -89,13 +54,9 @@ Examples:
     parser.add_argument('--skip-enhancement', action='store_true',
                         help='Skip AI enhancement')
 
-    # DPI settings
-    parser.add_argument('--dpi', type=int, default=300,
-                        help='Input DPI for PDF rendering (default: 300)')
-
     # Margin settings
     parser.add_argument('--margin-percent', type=int, default=7,
-                        help='Output margin percentage (default: 7)')
+                        help='Output margin percentage when margin whitening is disabled (default: 7)')
 
     # Bypass options (skip deskew/color/crop, but keep ESRGAN)
     parser.add_argument('--bypass-first', action='store_true',
@@ -111,13 +72,13 @@ Examples:
     parser.add_argument('--no-deskew', action='store_true',
                         help='Disable deskew for all pages')
     parser.add_argument('--deskew-exclude-pages', type=str, default=None,
-                        help='Page numbers (1-indexed) to skip deskew, e.g. "1,4,7-9"')
+                        help='Page numbers (1-indexed; 000.JPG is page 1) to skip deskew, e.g. "1,4,7-9"')
 
     # Show-through (bleed-through) removal - on for all pages by default (grayscale output)
     parser.add_argument('--no-bleed-removal', action='store_true',
                         help='Disable show-through/background removal for all pages')
     parser.add_argument('--bleed-removal-exclude-pages', type=str, default=None,
-                        help='Page numbers (1-indexed) to skip show-through removal, e.g. "1,4,7-9" '
+                        help='Page numbers (1-indexed; 000.JPG is page 1) to skip show-through removal, e.g. "1,4,7-9" '
                              '(they keep standard color adjustment, e.g. color/photo pages)')
     parser.add_argument('--bleed-bg-ksize', type=int, default=151,
                         help='Show-through removal: background estimation kernel size (default: 151)')
@@ -127,8 +88,6 @@ Examples:
                         help='Show-through removal: values >= this become paper/white; lower removes more (default: 205)')
 
     # Margin whitening - clear the text-free outer margin bands (on by default).
-    # A band is cleared only if it touches a page edge and runs to the opposite
-    # edge without any text, so text can never be erased.
     parser.add_argument('--no-margin-whitening', action='store_true',
                         help='Disable whitening of the text-free outer margin bands')
     parser.add_argument('--margin-pad', type=int, default=40,
@@ -138,11 +97,9 @@ Examples:
     parser.add_argument('--ocr-lang', type=str, default='eng+jpn',
                         help='Tesseract language codes (default: eng+jpn)')
 
-    # PDF output options
-    parser.add_argument('--pdf-format', type=str, default='jpeg', choices=['jpeg', 'png'],
-                        help='Image format in PDF (default: jpeg)')
+    # Output options
     parser.add_argument('--jpeg-quality', type=int, default=70,
-                        help='JPEG quality 0-100 (default: 70)')
+                        help='Output JPEG quality 0-100 (default: 70)')
 
     # Debug options
     parser.add_argument('--max-pages', type=int, default=None,
@@ -161,10 +118,10 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate input
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Error: Input file not found: {input_path}", file=sys.stderr)
+    # Validate input folder
+    input_dir = Path(args.input_dir)
+    if not input_dir.is_dir():
+        print(f"Error: Input folder not found: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
     # Auto-detect model if not specified
@@ -210,10 +167,8 @@ Examples:
         model_path=args.model,
         scale=args.scale,
         tile_size=args.tile,
-        dpi=args.dpi,
         keep_temp=args.keep_temp,
         ocr_lang=args.ocr_lang,
-        pdf_image_format=args.pdf_format,
         jpeg_quality=args.jpeg_quality,
         denoise_strength=args.denoise_strength,
         max_deskew_degree=args.max_deskew_degree,
@@ -261,8 +216,6 @@ Examples:
             except OSError:
                 term_width = 80
 
-            # Calculate bar width: total - brackets - spaces - percentage - count
-            # Format: [████░░░░] 100% (12/12)
             count_str = f"({current}/{total})"
             fixed_chars = 2 + 1 + 4 + 1 + len(count_str)  # [] + space + "100%" + space + count
             width = max(10, term_width - fixed_chars)
@@ -278,11 +231,10 @@ Examples:
     # Run conversion
     try:
         start_time = datetime.now()
-        result = convert_pdf(args.input, args.output, options, progress)
+        result = convert_images(args.input_dir, args.output_dir, options, progress)
         elapsed = datetime.now() - start_time
 
         if not args.quiet:
-            # Format elapsed time
             total_seconds = int(elapsed.total_seconds())
             hours, remainder = divmod(total_seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
@@ -294,7 +246,7 @@ Examples:
                 elapsed_str = f"{elapsed.total_seconds():.1f}s"
 
             print(f"\nConversion complete!")
-            print(f"  Input:  {args.input}")
+            print(f"  Input:  {args.input_dir}")
             print(f"  Output: {result.output_path}")
             print(f"  Time:   {elapsed_str}")
             print(f"  Pages:  {result.processed_pages}/{result.total_pages}")
@@ -302,10 +254,6 @@ Examples:
                 print(f"  Layout: Vertical (Japanese)")
             else:
                 print(f"  Layout: Horizontal")
-            if result.page_number_offset is not None:
-                print(f"  Page offset: {result.page_number_offset}")
-            if result.physical_page_start and result.logical_page_start:
-                print(f"  Page mapping: Physical {result.physical_page_start} → Logical {result.logical_page_start}")
 
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
