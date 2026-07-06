@@ -261,6 +261,9 @@ def remove_show_through(
     black_point: int = 115,
     white_point: int = 205,
     gamma: float = 1.0,
+    mask_threshold: int = 200,
+    edge_pad: int = 5,
+    soft_white_point: int = 235,
 ) -> np.ndarray:
     """
     Remove show-through (裏映り) text and non-uniform background color.
@@ -274,18 +277,31 @@ def remove_show_through(
       1. Estimate paper background via morphological closing (removes dark text,
          keeps illumination/paper) followed by a Gaussian blur.
       2. Flat-field: divide the image by the background so paper -> ~255 everywhere.
-      3. Contrast stretch between black_point and white_point: values at/below
-         black_point map to 0 (ink), values at/above white_point map to 255
-         (paper + show-through, which is always lighter than real ink).
+      3. Hard contrast stretch between black_point and white_point. This alone
+         gives a clean white background but clips the anti-aliased fringes of
+         glyphs, visually thinning the strokes - so it is used only to DECIDE
+         what matters, not as the final rendering.
+      4. Composite: pixels the hard stretch keeps dark form an importance mask;
+         the mask is dilated by edge_pad so glyph fringes are included, and
+         inside it the gently stretched flat-field tones (black_point ..
+         soft_white_point, no harsh white clipping) are used. Everything
+         outside the mask becomes pure white. This keeps the background
+         perfectly white while preserving the smooth anti-aliased edges of
+         text and image detail.
 
     Args:
         image: Input image (RGB format)
         bg_ksize: Background estimation kernel size (odd). Must be larger than the
                   thickest stroke / character spacing, or text gets eaten.
         black_point: Values <= this (after flat-field) become pure ink (0).
-        white_point: Values >= this (after flat-field) become pure paper (255).
-                     Lower it to remove show-through more aggressively.
-        gamma: Optional gamma applied to the stretched result (1.0 = linear).
+        white_point: Values >= this (after flat-field) count as background;
+                     lower it to remove show-through more aggressively.
+        gamma: Optional gamma applied to the stretched tones (1.0 = linear).
+        mask_threshold: Hard-stretch values below this mark important content.
+        edge_pad: Dilation radius (px) of the importance mask, so anti-aliased
+                  glyph fringes survive around every stroke.
+        soft_white_point: White point of the gentle foreground stretch (higher
+                          than white_point = smoother edges inside the mask).
 
     Returns:
         Show-through-removed image (RGB, 3-channel grayscale)
@@ -305,13 +321,36 @@ def remove_show_through(
     # 2) Flat-field division: paper -> ~255 uniformly across the page
     norm = gray.astype(np.float32) / (bg.astype(np.float32) + 1e-3) * 255.0
 
-    # 3) Contrast stretch: ink -> 0, paper + show-through -> 255
+    # 3) Hard contrast stretch: ink -> 0, paper + show-through -> 255.
+    #    Used only to decide what is important content (it clips glyph
+    #    fringes, so rendering it directly thins the strokes).
     denom = max(white_point - black_point, 1)
-    out = (norm - black_point) / denom
-    out = np.clip(out, 0.0, 1.0)
+    hard = np.clip((norm - black_point) / denom, 0.0, 1.0)
     if gamma != 1.0:
-        out = out ** gamma
-    out = (out * 255.0).astype(np.uint8)
+        hard = hard ** gamma
+    hard8 = (hard * 255.0).astype(np.uint8)
+
+    # 4) Importance mask (content the hard stretch keeps visibly dark),
+    #    dilated a little so the anti-aliased fringes of glyphs are covered
+    mask = (hard8 < mask_threshold).astype(np.uint8)
+    if edge_pad > 0:
+        mask = cv2.dilate(
+            mask, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * edge_pad + 1, 2 * edge_pad + 1))
+        )
+
+    # Gentle foreground tones: same black point, but a much higher white
+    # point, so glyph edge gradients survive instead of being clipped away
+    soft_denom = max(soft_white_point - black_point, 1)
+    soft = np.clip((norm - black_point) / soft_denom, 0.0, 1.0)
+    if gamma != 1.0:
+        soft = soft ** gamma
+    soft8 = (soft * 255.0).astype(np.uint8)
+
+    # Composite: white background, smooth tones inside the (padded) mask
+    out = np.full_like(hard8, 255)
+    m = mask > 0
+    out[m] = soft8[m]
 
     # Return as 3-channel RGB so downstream (bbox, crop, PDF) stays uniform
     return cv2.cvtColor(out, cv2.COLOR_GRAY2RGB)
