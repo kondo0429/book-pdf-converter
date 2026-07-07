@@ -197,6 +197,28 @@ class ConversionResult:
     logical_page_start: Optional[int] = None
 
 
+def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    """Fit a processed page onto a white canvas of the source image's size.
+
+    The pipeline crops the page, so its aspect ratio differs slightly from the
+    source; scale to fit (no distortion) and center on white - the page
+    background is white anyway, so the padding is invisible. Returns the image
+    unchanged when it already has the target size.
+    """
+    oh, ow = image.shape[:2]
+    if (ow, oh) == (target_w, target_h):
+        return image
+    fit = min(target_w / ow, target_h / oh)
+    nw = max(1, int(round(ow * fit)))
+    nh = max(1, int(round(oh * fit)))
+    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+    x0 = (target_w - nw) // 2
+    y0 = (target_h - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
+
+
 def convert_pdf(
     input_path: str | Path,
     output_path: str | Path,
@@ -272,6 +294,7 @@ def convert_pdf(
 
         report(0, pages_to_extract, "Step 1: Extracting pages from PDF...")
 
+        src_sizes: List[Tuple[int, int]] = []  # (width, height) of each page
         for idx, (page_num, image) in enumerate(extract_pages(
             input_path,
             dpi=options.dpi,
@@ -279,6 +302,7 @@ def convert_pdf(
             end_page=pages_to_extract,
             grayscale=False,
         )):
+            src_sizes.append((image.shape[1], image.shape[0]))
             # Save as PNG
             out_path = os.path.join(pdf_extracted_dir, f"page_{page_num + 1:04d}.png")
             cv2.imwrite(out_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
@@ -377,16 +401,21 @@ def convert_pdf(
         ])
 
         def load_final_images():
-            for path in output_files:
+            for idx, path in enumerate(output_files):
                 img = cv2.imread(path)
+                # Fit each processed page back to the pixel size of the page
+                # image extracted from the source PDF, so output pages have
+                # the same dimensions (and, embedded at the extraction DPI,
+                # the same physical page size) as the input.
+                if idx < len(src_sizes):
+                    tw, th = src_sizes[idx]
+                    img = _fit_to_source_size(img, tw, th)
                 yield cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # Calculate DPI for output
-        # C# always uses 300 DPI for embedding images into PDF
-        # regardless of whether enhancement was used.
-        # Final images are always scaled to FINAL_TARGET_HEIGHT (3508),
-        # so 300 DPI gives correct page size (3508/300*72 = 841.92 pts)
-        output_dpi = 300
+        # Embed at the extraction DPI: pages were rendered from the source at
+        # options.dpi and are fitted back to that pixel size, so embedding at
+        # the same DPI reproduces the original physical page size.
+        output_dpi = options.dpi
 
         build_pdf(
             load_final_images(),
@@ -430,7 +459,9 @@ def convert_images(
     Convert scanned JPEG pages with the same processing pipeline as
     convert_pdf (crop, enhancement, deskew, color/show-through, margin
     whitening, crop unification, OCR alignment), writing one processed JPEG
-    per input file under the same name.
+    per input file under the same name and with the same pixel dimensions as
+    the input (the processed page is fitted onto a white canvas of the
+    input's size).
 
     Input files are expected to be numbered like 000.JPG, 001.JPG, ... in
     ascending order. Gaps in the numbering are allowed: the file number is
@@ -529,11 +560,13 @@ def convert_images(
         # =====================================================================
         report(0, total_pages, "Step 1: Loading and cropping scan margins...")
 
+        src_sizes: List[Tuple[int, int]] = []  # (width, height) of each input
         for idx, (src_path, num) in enumerate(zip(src_paths, page_numbers)):
             image = cv2.imread(str(src_path))
             if image is None:
                 raise IOError(f"Cannot read image: {src_path}")
             h, w = image.shape[:2]
+            src_sizes.append((w, h))
 
             if w >= 10 and h >= 10:
                 margin_w = int(w * 0.005)
@@ -608,6 +641,11 @@ def convert_images(
                 report(idx + 1, total_pages, f"WARNING: no output for {name}")
                 continue
             image = cv2.imread(adjusted_path)
+
+            # Fit the processed page back to the input file's pixel size, so
+            # each output JPEG has exactly the same dimensions as its input.
+            image = _fit_to_source_size(image, *src_sizes[idx])
+
             cv2.imwrite(
                 str(output_dir / name), image,
                 [cv2.IMWRITE_JPEG_QUALITY, options.jpeg_quality],

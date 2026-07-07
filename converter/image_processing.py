@@ -548,7 +548,7 @@ def remove_margin_background(
     # could be a header
     num, labels, stats, _ = cv2.connectedComponentsWithStats(text, 8)
     strip = edge_exclude_frac * w
-    keep = np.zeros((h, w), dtype=bool)
+    kept_ids = []
     for i in range(1, num):
         x, y, bw, bh, area = stats[i]
         if area < min_area_frac * total:
@@ -556,7 +556,7 @@ def remove_margin_background(
         # Fully inside the outer left/right strip -> edge junk, not text
         if x + bw <= strip or x >= w - strip:
             continue
-        keep |= (labels == i)
+        kept_ids.append(i)
 
     # Junk detected on the PRE-adjustment image (see detect_page_edge_junk):
     # photography-stand slabs and page-edge shadow lines must not count as
@@ -564,14 +564,37 @@ def remove_margin_background(
     # be detected before the show-through flat-field (which turns solid slabs
     # into mottled texture that mimics text density), so the caller passes the
     # mask in.
+    keep = np.zeros((h, w), dtype=bool)
     if junk_mask is not None and junk_mask.any():
         # Fatten past the box-filter halo so the stroke-density ring around a
         # junk structure is removed from the text mask as well
         fat = cv2.dilate(
             junk_mask, cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (2 * dens_win + 1, 2 * dens_win + 1))
-        )
-        keep &= (fat == 0)
+        ) > 0
+        # Component-aware subtraction: a text component mostly swallowed by
+        # the junk halo is dropped UNLESS it carries glyph-sized real ink -
+        # a page number or an edge text column sitting on top of a faint
+        # show-through column / edge shadow must survive, while junk halos
+        # (no ink) and shadow cores (tall continuous ink) are still dropped.
+        ink = gray < 100
+        glyph_max_h = int(h * 0.05)
+        for i in kept_ids:
+            comp = labels == i
+            cover = float(fat[comp].mean())
+            if cover <= 0.5:
+                # mostly clear: keep, trimming the junk-covered part
+                keep |= comp & ~fat
+                continue
+            comp_ink = (comp & ink).astype(np.uint8)
+            n_ink = int(comp_ink.sum())
+            if n_ink >= 200:
+                num_k, _, st_k, _ = cv2.connectedComponentsWithStats(comp_ink, 8)
+                if num_k > 1 and st_k[1:, cv2.CC_STAT_HEIGHT].max() <= glyph_max_h:
+                    keep |= comp  # real glyphs (e.g. page number) - rescue
+    else:
+        for i in kept_ids:
+            keep |= (labels == i)
 
     if not keep.any():
         # No text found (blank or photo-only page misdetection) - do nothing
