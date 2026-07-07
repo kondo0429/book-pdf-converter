@@ -872,10 +872,12 @@ def _perform_pages_yohaku(
         # extent records how much page-edge area was cleared on each side;
         # Phase 4 re-grants margins of the same size around the crop.
         if not options.disable_margin_whitening:
+            mw_dbg: dict = {}
             whitened, extent = remove_margin_background(
                 adjusted,
                 margin_pad=options.margin_pad,
                 junk_mask=edge_junk,
+                debug_out=mw_dbg if options.debug else None,
             )
             adjusted = np.ascontiguousarray(whitened)
             page.margin_extent = extent
@@ -888,6 +890,12 @@ def _perform_pages_yohaku(
                 margin_dbg = (f'margins cleared L={l} T={t} '
                               f'R={w_img - r} B={h_img - b} px'
                               f' (edge junk masked={junk_px:,} px)')
+                if options.debug:
+                    margin_dbg += (
+                        f' | smudges whitened={mw_dbg.get("smudges", 0)}'
+                        f' ({mw_dbg.get("smudge_px", 0):,} px)'
+                        f' | edge band L={mw_dbg.get("edge_band_l", 0)}'
+                        f' R={mw_dbg.get("edge_band_r", 0)} px')
         else:
             margin_dbg = 'margin whitening SKIPPED (--no-margin-whitening)'
 

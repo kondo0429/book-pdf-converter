@@ -366,19 +366,33 @@ def detect_page_edge_junk(
     run_frac: float = 0.08,
     max_bar_thickness: int = 150,
     dark_ratio: float = 0.8,
+    vbar_dark_ratio: float = 0.93,
+    vbar_ink_dark: int = 90,
+    vbar_ink_max_frac: float = 0.06,
 ) -> np.ndarray:
     """
-    Detect scan junk (photography stand slabs, page-edge / fold shadow lines)
-    on the PRE-color-adjustment image, where they are still solid dark shapes.
+    Detect scan junk (photography stand slabs, page-edge / fold / spine
+    shadows) on the PRE-color-adjustment image, where they are still solid
+    dark shapes.
 
     The show-through flat-field neutralizes the interior of large dark slabs
     into mottled texture that mimics text density, so junk must be located
-    BEFORE that step. Two rules, both physically impossible for print:
+    BEFORE that step. Three rules, all physically impossible for print:
     (1) dark regions touching the image border - the padded internal image
         never has print at its border (photography stand / scan bed)
     (2) thin continuous dark bars (>= run_frac of the image dimension long,
         <= max_bar_thickness thick) - text always breaks between characters,
         so such runs can't be text (page-edge / fold shadow lines).
+    (3) thin continuous VERTICAL bars at a fainter threshold (vbar_dark_ratio)
+        - smooth low-contrast spine/gutter shadows and reverse-side
+        show-through columns. Real text never forms such a bar (characters
+        leave gaps), and as an extra guard any candidate that actually
+        contains dark ink (>= vbar_ink_max_frac of pixels darker than
+        vbar_ink_dark) is skipped, so a dense text column near the edge is
+        never masked.
+    The mask is only used to keep these structures from anchoring the text
+    extent (they are excluded from the text detection); it does not paint
+    anything, so nothing that is real text can be erased.
     Photos are safe: they don't touch the border and are thick in both
     directions.
 
@@ -387,8 +401,14 @@ def detect_page_edge_junk(
         border: Border contact distance in px for rule (1)
         min_area: Minimum component area for rule (1)
         run_frac: Minimum continuous run length as a fraction of height/width
-        max_bar_thickness: Maximum thickness for rule (2) bars
-        dark_ratio: Pixels darker than paper * dark_ratio count as dark
+        max_bar_thickness: Maximum thickness for the bar rules
+        dark_ratio: Pixels darker than paper * dark_ratio count as dark for
+                    rules (1) and (2)
+        vbar_dark_ratio: Fainter threshold for rule (3) so smooth low-contrast
+                         spine/gutter shadows are caught
+        vbar_ink_dark: Pixels darker than this count as real ink for rule (3)
+        vbar_ink_max_frac: Skip a rule-(3) bar whose real-ink fraction exceeds
+                           this (it is a text column, not a shadow)
 
     Returns:
         uint8 mask (1 = junk) in the same geometry as `image`
@@ -434,6 +454,21 @@ def detect_page_edge_junk(
         if st_h[i, cv2.CC_STAT_HEIGHT] <= max_bar_thickness:
             junk[lab_h == i] = 1
 
+    # (3) thin continuous vertical bars at the fainter vbar threshold: smooth
+    #     spine/gutter shadows and show-through columns. Skip any candidate
+    #     that carries real ink (a dense text column), so text is never masked.
+    dark_v = (gray < max(60.0, paper * vbar_dark_ratio)).astype(np.uint8)
+    bars = cv2.dilate(cv2.erode(dark_v, np.ones((run_v, 1), np.uint8)),
+                      np.ones((run_v, 1), np.uint8))
+    num_v, lab_v, st_v, _ = cv2.connectedComponentsWithStats(bars, 8)
+    for i in range(1, num_v):
+        if st_v[i, cv2.CC_STAT_WIDTH] > max_bar_thickness:
+            continue
+        comp = lab_v == i
+        if float((gray[comp] < vbar_ink_dark).mean()) > vbar_ink_max_frac:
+            continue  # dense ink -> text column, not a shadow
+        junk[comp] = 1
+
     return junk
 
 
@@ -451,6 +486,7 @@ def remove_margin_background(
     edge_exclude_frac: float = 0.10,
     paper: int = 255,
     junk_mask: Optional[np.ndarray] = None,
+    debug_out: Optional[dict] = None,
 ) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
     """
     Whiten the four outer margin bands that contain no text.
@@ -553,7 +589,227 @@ def remove_margin_background(
     out[bottom:] = paper
     out[:, :left] = paper
     out[:, right:] = paper
+
+    # Whiten residual spine/gutter-shadow smudges. The flat-field turns a thin
+    # smooth binding shadow into wider lens-shaped smudges that carry dark
+    # cores; those cores cross the edge-exclude boundary, get kept as text, and
+    # re-anchor the margin band so the band stops short of them. They are still
+    # SMOOTH (low Laplacian) unlike real ink strokes, so they are removed here
+    # by detecting smooth dark vertical smudges in the outer side margins and
+    # painting them out. Confined to the central height band (page numbers /
+    # running heads in the top/bottom corners are handled by the bands and left
+    # alone) and to the outer side zones (body text is never touched); the
+    # smoothness gate keeps real edge text, which is sharp, safe.
+    out = _whiten_shadow_smudges(out, paper_value=paper, debug_out=debug_out)
+
+    # Whiten fore-edge page-stack shadows: a dark or faint band hugging the
+    # page edge - the exposed stack of page edges. It is neither smooth (so
+    # the smudge pass misses it) nor free of ink (so the junk pass skips it),
+    # and it re-anchors the text extent, so the margin bands stop right at it.
+    # Search therefore starts at the freshly painted band boundaries (the text
+    # extent edges), walking inward through the depressed brightness band.
+    out = _whiten_edge_dark_band(out, paper_value=paper,
+                                 anchor_l=left, anchor_r=right,
+                                 debug_out=debug_out)
+
     return out, (left, top, right, bottom)
+
+
+def _whiten_edge_dark_band(
+    image: np.ndarray,
+    paper_value=255,
+    anchor_l: int = 0,
+    anchor_r: Optional[int] = None,
+    recover_ratio: float = 0.93,
+    white_recover: int = 252,
+    smooth_frac: float = 0.015,
+    cap_frac: float = 0.18,
+    anchor_frac: float = 0.04,
+    gap_frac: float = 0.012,
+    head_foot_frac: float = 0.10,
+    ink_keep: int = 100,
+    debug_out: Optional[dict] = None,
+) -> np.ndarray:
+    """Paint out a dark band anchored to the outer margin boundary.
+
+    Targets fore-edge page-stack shadows: a band (textured, smooth, or faint)
+    that hugs the page edge. Such a band re-anchors the text extent, so the
+    margin bands whiten only up to it and the band itself survives - therefore
+    the search starts at the band boundary (anchor_l / anchor_r, the text
+    extent edges the caller just painted up to), not at the image border.
+    Starting within anchor_frac of that boundary, the contiguous run of
+    columns below the recovery threshold (small bright gaps up to gap_frac
+    are bridged) is painted out, capped at cap_frac.
+
+    Real text is protected by validating the collected strip before painting:
+    the strip is only painted when it contains a column with a CONTINUOUS
+    non-white vertical run of at least vrun_frac of the height. A page-stack
+    shadow (solid core or faint band) always has such columns; text never
+    does (characters leave gaps), so a strip that is actually the text block
+    is rejected. Within a painted strip, ink pixels are preserved, so a page
+    number or running head that happens to sit there keeps its glyphs.
+
+    On flat-fielded pages the background is exactly white, so any column mean
+    below white_recover marks the band (catches even very faint stack
+    shadows). On non-whitened (color) pages a conservative paper*recover_ratio
+    is used instead.
+    """
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    h, w = gray.shape
+    if anchor_r is None:
+        anchor_r = w
+    paper = float(np.median(gray[int(h * 0.25):int(h * 0.75),
+                                 int(w * 0.35):int(w * 0.65)]))
+    hf = int(h * head_foot_frac)
+    central = gray[hf:h - hf, :]
+    col = central.astype(np.float32).mean(axis=0)
+    k = (int(w * smooth_frac) // 2) * 2 + 1
+    cs = cv2.blur(col.reshape(1, -1), (k, 1)).ravel()
+    cap = int(w * cap_frac)
+    anchor = int(w * anchor_frac)
+    gap = max(int(w * gap_frac), 1)
+    if paper >= 250:
+        rec = float(white_recover)
+    else:
+        rec = paper * recover_ratio
+
+    def strip_width(vals) -> int:
+        """Width of the anchored depressed band (anchor boundary at index 0)."""
+        end = 0
+        gap_run = 0
+        started = False
+        for j in range(min(cap, len(vals))):
+            if vals[j] < rec:
+                end = j + 1
+                gap_run = 0
+                started = True
+            else:
+                if not started:
+                    if j >= anchor:
+                        break
+                else:
+                    gap_run += 1
+                    if gap_run > gap:
+                        break
+        return end
+
+    def strip_is_junk(x0: int, x1: int) -> bool:
+        """True when the strip has a continuous non-white vertical run that
+        text can never produce (characters always leave gaps)."""
+        if x1 <= x0:
+            return False
+        seg = (central[:, x0:x1] < rec).astype(np.uint8)
+        # bridge small speckle holes so a textured/faint band still counts
+        seg = cv2.morphologyEx(seg, cv2.MORPH_CLOSE, np.ones((9, 1), np.uint8))
+        run = max(int(h * 0.08), 1)
+        return bool(cv2.erode(seg, np.ones((run, 1), np.uint8)).any())
+
+    out = image.copy()
+
+    def paint(x0: int, x1: int):
+        """Whiten columns [x0, x1) full height, but keep glyph-sized ink.
+
+        Ink components no taller than a glyph (page numbers, running heads
+        crossing the strip) are preserved; tall ink components (the solid
+        core of the stack shadow) are painted out with the rest.
+        """
+        ink = (gray[:, x0:x1] < ink_keep).astype(np.uint8)
+        protect = np.zeros_like(ink, dtype=bool)
+        if ink.any():
+            num, lab, st, _ = cv2.connectedComponentsWithStats(ink, 8)
+            glyph_max_h = int(h * 0.05)
+            for i in range(1, num):
+                if st[i, cv2.CC_STAT_HEIGHT] <= glyph_max_h:
+                    protect[lab == i] = True
+        region = out[:, x0:x1]
+        region[~protect] = paper_value
+        out[:, x0:x1] = region
+
+    li = strip_width(cs[anchor_l:])
+    if li > 0 and strip_is_junk(anchor_l, anchor_l + li):
+        paint(0, anchor_l + li)
+    else:
+        li = 0
+    ri = strip_width(cs[:anchor_r][::-1])
+    if ri > 0 and strip_is_junk(anchor_r - ri, anchor_r):
+        paint(anchor_r - ri, w)
+    else:
+        ri = 0
+    if debug_out is not None:
+        debug_out['edge_band_l'] = li
+        debug_out['edge_band_r'] = ri
+    return out
+
+
+def _whiten_shadow_smudges(
+    image: np.ndarray,
+    paper_value=255,
+    dark_ratio: float = 0.93,
+    sharp_lap: float = 25.0,
+    sharp_max_frac: float = 0.50,
+    min_area: int = 800,
+    side_zone_frac: float = 0.14,
+    head_foot_frac: float = 0.10,
+    debug_out: Optional[dict] = None,
+) -> np.ndarray:
+    """Paint out smooth dark smudges in the outer side margins.
+
+    Targets flat-field lens-shaped spine/gutter shadow residue: the flat-field
+    turns a thin smooth binding shadow into wider lens-shaped smudges (plus
+    faint horizontal streaks) that carry dark cores. They are dark but SMOOTH -
+    only a small fraction of their dark pixels are sharp edges - whereas real
+    text is mostly sharp strokes. Each dark connected component in the outer
+    side_zone_frac (within the central height band) is painted out only when
+    its sharp-pixel fraction is below sharp_max_frac, so the whole 2-D smudge
+    is covered while sharp edge text (a title reaching near the margin, a body
+    column) is kept. The side-zone / central-band limits also protect page
+    numbers, running heads and body text.
+    """
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    h, w = gray.shape
+    paper = float(np.median(gray[int(h * 0.25):int(h * 0.75),
+                                 int(w * 0.35):int(w * 0.65)]))
+    hf = int(h * head_foot_frac)
+    side = int(w * side_zone_frac)
+    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    sharp = (lap > sharp_lap)
+
+    # Dark connected components, restricted to the central height band
+    dark = (gray < max(60.0, paper * dark_ratio)).astype(np.uint8)
+    dark[:hf] = 0
+    dark[h - hf:] = 0
+    # Close small gaps so lens core + surrounding streaks form one component
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
+    num, lab, st, _ = cv2.connectedComponentsWithStats(dark, 8)
+    out = image.copy()
+    n_painted = 0
+    px_painted = 0
+    for i in range(1, num):
+        x = st[i, cv2.CC_STAT_LEFT]
+        bw = st[i, cv2.CC_STAT_WIDTH]
+        area = st[i, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+        cx = x + bw // 2
+        if not (cx < side or cx > w - side):
+            continue  # not in an outer side margin -> leave it
+        comp = lab == i
+        if float(sharp[comp].mean()) >= sharp_max_frac:
+            continue  # mostly sharp -> real text, keep it
+        out[comp] = paper_value
+        n_painted += 1
+        px_painted += int(area)
+    if debug_out is not None:
+        debug_out['smudges'] = n_painted
+        debug_out['smudge_px'] = px_painted
+    return out
 
 
 # =============================================================================
