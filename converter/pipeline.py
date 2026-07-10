@@ -220,6 +220,40 @@ def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int) -> np.n
     return canvas
 
 
+def _read_jpeg_dpi(path: str | Path) -> Optional[Tuple[float, float]]:
+    """Return the (x, y) DPI stored in a JPEG's metadata, or None if absent.
+
+    A JFIF density of (1, 1) with no unit (aspect-ratio only) carries no real
+    resolution and is treated as absent.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            dpi = im.info.get('dpi')
+            if dpi and float(dpi[0]) > 1 and float(dpi[1]) > 1:
+                return (float(dpi[0]), float(dpi[1]))
+    except Exception:
+        pass
+    return None
+
+
+def _save_jpeg_with_dpi(path: str, image_bgr: np.ndarray, quality: int,
+                        dpi: Optional[Tuple[float, float]]) -> None:
+    """Write a BGR image as JPEG, stamping DPI metadata so PDF/OCR tools infer
+    a sane physical page size (Acrobat assumes 72 DPI when it is missing, which
+    makes large scans exceed its 45x45 inch page limit).
+
+    Falls back to the source DPI when known, otherwise 300 DPI.
+    """
+    dx, dy = dpi if dpi is not None else (300.0, 300.0)
+    from PIL import Image
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    Image.fromarray(rgb).save(
+        path, format='JPEG', quality=quality,
+        dpi=(int(round(dx)), int(round(dy))),
+    )
+
+
 def convert_pdf(
     input_path: str | Path,
     output_path: str | Path,
@@ -562,12 +596,14 @@ def convert_images(
         report(0, total_pages, "Step 1: Loading and cropping scan margins...")
 
         src_sizes: List[Tuple[int, int]] = []  # (width, height) of each input
+        src_dpis: List[Optional[Tuple[float, float]]] = []  # DPI per input
         for idx, (src_path, num) in enumerate(zip(src_paths, page_numbers)):
             image = cv2.imread(str(src_path))
             if image is None:
                 raise IOError(f"Cannot read image: {src_path}")
             h, w = image.shape[:2]
             src_sizes.append((w, h))
+            src_dpis.append(_read_jpeg_dpi(src_path))
 
             if w >= 10 and h >= 10:
                 margin_w = int(w * 0.005)
@@ -647,9 +683,9 @@ def convert_images(
             # each output JPEG has exactly the same dimensions as its input.
             image = _fit_to_source_size(image, *src_sizes[idx])
 
-            cv2.imwrite(
+            _save_jpeg_with_dpi(
                 str(output_dir / name), image,
-                [cv2.IMWRITE_JPEG_QUALITY, options.jpeg_quality],
+                options.jpeg_quality, src_dpis[idx],
             )
             written += 1
             report(idx + 1, total_pages, f"Writing {name}")
