@@ -13,6 +13,7 @@ This module matches the C# implementation exactly, including:
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, List, Set, Tuple
@@ -870,22 +871,31 @@ def _perform_pages_yohaku(
 
     def process_phase3(page: PageInfo) -> Tuple[PageInfo, Optional[PageBoundingBox]]:
         """Process a single page for Phase 3 (color adjustment, bounding box)."""
+        tm: dict = {}
+
         # Load deskewed image
+        _t = time.perf_counter()
         img_bgr = cv2.imread(page.deskew_file_path)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        tm['load'] = time.perf_counter() - _t
 
         # Detect scan junk (photography stand, page-edge shadow lines) on the
         # PRE-adjustment image where those are still solid dark shapes - the
         # show-through flat-field would turn them into text-like texture.
         edge_junk = None
+        junk_dbg: dict = {}
+        _t = time.perf_counter()
         if not options.disable_margin_whitening:
-            edge_junk = detect_page_edge_junk(img_rgb)
+            edge_junk = detect_page_edge_junk(
+                img_rgb, debug_out=junk_dbg if options.debug else None)
+        tm['junk'] = time.perf_counter() - _t
 
         # Show-through removal runs on all pages by default; skip if globally
         # disabled or this page is excluded (excluded pages keep the standard
         # global color adjustment).
         bleed_exclude = options.bleed_removal_exclude_pages or set()
         apply_bleed = not options.no_bleed_removal and page.page_number not in bleed_exclude
+        _t = time.perf_counter()
         if apply_bleed:
             adjusted = remove_show_through(
                 img_rgb,
@@ -904,13 +914,15 @@ def _perform_pages_yohaku(
             ApplyGlobalColorAdjustment(adjusted, color_param)
             why = '--no-bleed-removal' if options.no_bleed_removal else 'excluded page'
             color_dbg = f'show-through SKIPPED ({why}) -> global color adjustment (color kept)'
+        tm['adjust'] = time.perf_counter() - _t
 
         # Whiten the text-free outer margin bands (before bbox so the crop
         # isn't pulled toward edge junk / spine shadows). The returned text
         # extent records how much page-edge area was cleared on each side;
         # Phase 4 re-grants margins of the same size around the crop.
+        mw_dbg: dict = {}
+        _t = time.perf_counter()
         if not options.disable_margin_whitening:
-            mw_dbg: dict = {}
             whitened, extent = remove_margin_background(
                 adjusted,
                 margin_pad=options.margin_pad,
@@ -919,7 +931,7 @@ def _perform_pages_yohaku(
             )
             adjusted = np.ascontiguousarray(whitened)
             page.margin_extent = extent
-            junk_px = int(edge_junk.sum()) if edge_junk is not None else 0
+            junk_px = int((edge_junk > 0).sum()) if edge_junk is not None else 0
             if extent is None:
                 margin_dbg = 'margin whitening: no text detected -> left unchanged'
             else:
@@ -936,19 +948,48 @@ def _perform_pages_yohaku(
                         f' R={mw_dbg.get("edge_band_r", 0)} px')
         else:
             margin_dbg = 'margin whitening SKIPPED (--no-margin-whitening)'
+        tm['margin'] = time.perf_counter() - _t
 
         # Save color-adjusted image
+        _t = time.perf_counter()
         color_adj_path = os.path.join(tmp_dir, f"coloradj_{page.page_number:04d}.png")
         cv2.imwrite(color_adj_path, cv2.cvtColor(adjusted, cv2.COLOR_RGB2BGR))
         page.color_adj_file_path = color_adj_path
+        tm['save'] = time.perf_counter() - _t
 
         # Detect bounding box (Cython - uses OpenCV which releases GIL internally)
+        _t = time.perf_counter()
         bbox = DetectTextBoundingBox(adjusted)
+        tm['bbox'] = time.perf_counter() - _t
         page.bounding_box = bbox
         if options.debug:
+            tm['total'] = sum(tm.values())
+            # Fold in the sub-timings measured inside the junk detector and
+            # the margin whitening, so the log shows where the time goes
+            tm['junk.r1'] = junk_dbg.get('t_junk_r1', 0.0)
+            tm['junk.r2'] = junk_dbg.get('t_junk_r2', 0.0)
+            tm['junk.r3'] = junk_dbg.get('t_junk_r3', 0.0)
+            tm['margin.textmask'] = mw_dbg.get('t_textmask', 0.0)
+            tm['margin.subtract'] = mw_dbg.get('t_subtract', 0.0)
+            tm['margin.bands'] = mw_dbg.get('t_bands', 0.0)
+            tm['margin.smudge'] = mw_dbg.get('t_smudge', 0.0)
+            tm['margin.edgeband'] = mw_dbg.get('t_edgeband', 0.0)
+            page.debug_info['t3'] = dict(tm)
+            timing = (f"t={tm['total']:.1f}s (load={tm['load']:.1f} "
+                      f"junk={tm['junk']:.1f}"
+                      f"[r1={tm['junk.r1']:.1f} r2={tm['junk.r2']:.1f} r3={tm['junk.r3']:.1f}] "
+                      f"adjust={tm['adjust']:.1f} "
+                      f"margin={tm['margin']:.1f}"
+                      f"[text={tm['margin.textmask']:.1f} sub={tm['margin.subtract']:.1f} "
+                      f"smudge={tm['margin.smudge']:.1f} edge={tm['margin.edgeband']:.1f}] "
+                      f"save={tm['save']:.1f} bbox={tm['bbox']:.1f}) | "
+                      f"comps: junk r1={junk_dbg.get('junk_r1_comps', 0)} "
+                      f"r3={junk_dbg.get('junk_r3_comps', 0)}, "
+                      f"text={mw_dbg.get('text_comps', 0)} "
+                      f"(kept={mw_dbg.get('text_kept', 0)} strip={mw_dbg.get('text_strip', 0)})")
             page.debug_info['color'] = (
                 f'{color_dbg} | {margin_dbg} | '
-                f'bbox=(x={bbox[0]}, y={bbox[1]}, w={bbox[2]}, h={bbox[3]})')
+                f'bbox=(x={bbox[0]}, y={bbox[1]}, w={bbox[2]}, h={bbox[3]}) | {timing}')
 
         # C# does NOT skip any pages from crop calculation
         # All pages with valid bounding boxes are included
@@ -981,6 +1022,29 @@ def _perform_pages_yohaku(
                     even_bboxes.append(page_bbox)
 
     dbg_pages('color')
+
+    # Phase 4.3 timing summary: aggregate the per-page step timings so the
+    # dominant cost is visible at a glance (sums are CPU-time across parallel
+    # workers, so they show relative weight rather than wall time)
+    if options.debug:
+        agg: dict = {}
+        n_pages = 0
+        for p in page_infos:
+            t3 = p.debug_info.get('t3')
+            if not t3:
+                continue
+            n_pages += 1
+            for k, v in t3.items():
+                agg[k] = agg.get(k, 0.0) + v
+        if n_pages:
+            dbg(f"Phase 4.3 timing summary over {n_pages} pages "
+                f"(sum across workers; avg/page in parentheses):")
+            for k in sorted(agg, key=agg.get, reverse=True):
+                if k == 'total':
+                    continue
+                dbg(f"  {k:18} {agg[k]:8.1f}s  ({agg[k] / n_pages:5.2f}s)")
+            dbg(f"  {'TOTAL':18} {agg.get('total', 0.0):8.1f}s  "
+                f"({agg.get('total', 0.0) / n_pages:5.2f}s)")
 
     # =========================================================================
     # Phase 4: Decide crop regions
