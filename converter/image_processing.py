@@ -1461,7 +1461,8 @@ def apply_global_color_adjustment_fast(image: np.ndarray, param: GlobalColorPara
 # =============================================================================
 # (C) Bounding Box Detection
 # =============================================================================
-def detect_text_bounding_box(image: np.ndarray) -> Tuple[int, int, int, int]:
+def detect_text_bounding_box(image: np.ndarray,
+                             border_px: Optional[int] = None) -> Tuple[int, int, int, int]:
     """
     Detect text bounding box in document image.
 
@@ -1476,6 +1477,12 @@ def detect_text_bounding_box(image: np.ndarray) -> Tuple[int, int, int, int]:
 
     Args:
         image: Input image (RGB or grayscale)
+        border_px: Width of the border strip blanked to white before
+            measuring. None keeps the C# default of 1% of each dimension.
+            The blank strip caps the measurable extent, so text lying within
+            it is invisible to the bbox; pass a small value (e.g. 2) when the
+            image's margins were already cleaned (margin whitening), where
+            text can legitimately reach near the page edge.
 
     Returns:
         Tuple (x, y, width, height) of bounding box, or (0,0,0,0) if none found
@@ -1487,9 +1494,13 @@ def detect_text_bounding_box(image: np.ndarray) -> Tuple[int, int, int, int]:
 
     h, w = gray.shape
 
-    # Step 1: Fill 1% border with white (255) to ignore edge noise
-    border_x = max(w // 100, 1)
-    border_y = max(h // 100, 1)
+    # Step 1: Fill border with white (255) to ignore edge noise
+    if border_px is None:
+        border_x = max(w // 100, 1)
+        border_y = max(h // 100, 1)
+    else:
+        border_x = max(border_px, 1)
+        border_y = max(border_px, 1)
 
     # Top
     gray[:border_y, :] = 255
@@ -1652,6 +1663,83 @@ def decide_group_crop_region(bounding_boxes: List[PageBoundingBox]) -> Tuple[int
     width = max(right - left, 0)
     height = max(bottom - top, 0)
 
+    if width == 0 or height == 0:
+        return (0, 0, 0, 0)
+
+    return (left, top, width, height)
+
+
+def decide_group_crop_region_envelope(
+    bounding_boxes: List[PageBoundingBox],
+) -> Tuple[int, int, int, int]:
+    """Decide a group crop region that never clips any inlier page's text.
+
+    Same Tukey-fence outlier rejection as :func:`decide_group_crop_region`
+    (so junk / figure pages whose text bbox blows out one edge are still
+    excluded), but the final region is the *envelope* (min left, min top,
+    max right, max bottom) of the inliers instead of their median.
+
+    The median-based crop places its right edge at the median text extent, so
+    every page whose text reaches the common (gutter-side) maximum has its
+    outermost column sliced off - the reported "right-edge characters cut"
+    bug. Because a shared crop must contain all pages' text to avoid clipping
+    any of them, the correct boundary is the inlier extreme, not the median.
+    Outliers are still dropped, so a single figure page cannot balloon the
+    crop.
+
+    Returns (left, top, width, height); (0, 0, 0, 0) when empty/degenerate.
+    """
+    if not bounding_boxes:
+        return (0, 0, 0, 0)
+
+    # Accept either the Cython PageBoundingBox (.Left/.Top/.Width/.Height, as
+    # produced by the pipeline) or the Python one (.bbox tuple).
+    def get_edges(b):
+        if hasattr(b, 'Left'):
+            x, y, w, h = b.Left, b.Top, b.Width, b.Height
+        else:
+            x, y, w, h = b.bbox
+        return (x, y, w, h, x + w - 1, y + h - 1)  # x,y,w,h,right,bottom
+
+    valid = [get_edges(b) for b in bounding_boxes]
+    valid = [e for e in valid if e[2] > 0 and e[3] > 0]
+    if not valid:
+        return (0, 0, 0, 0)
+
+    edges = [(e[0], e[1], e[4], e[5]) for e in valid]  # left, top, right, bottom
+    lefts = sorted(e[0] for e in edges)
+    tops = sorted(e[1] for e in edges)
+    rights = sorted(e[2] for e in edges)
+    bottoms = sorted(e[3] for e in edges)
+
+    def fence(sorted_vals):
+        q1 = percentile_int(sorted_vals, 0.25)
+        q3 = percentile_int(sorted_vals, 0.75)
+        iqr = max(q3 - q1, 1)
+        return q1 - TUKEY_K * iqr, q3 + TUKEY_K * iqr
+
+    fl, ft, fr, fb = fence(lefts), fence(tops), fence(rights), fence(bottoms)
+
+    def is_out(v, f):
+        return v < f[0] or v > f[1]
+
+    inliers = []
+    for e in edges:
+        left, top, right, bottom = e
+        if not (is_out(left, fl) or is_out(top, ft)
+                or is_out(right, fr) or is_out(bottom, fb)):
+            inliers.append(e)
+
+    if len(inliers) < max(3, len(valid) // 2):
+        inliers = edges
+
+    left = min(e[0] for e in inliers)
+    top = min(e[1] for e in inliers)
+    right = max(e[2] for e in inliers)
+    bottom = max(e[3] for e in inliers)
+
+    width = max(right - left, 0)
+    height = max(bottom - top, 0)
     if width == 0 or height == 0:
         return (0, 0, 0, 0)
 

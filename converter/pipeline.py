@@ -32,10 +32,8 @@ from .image_processing_cy import (
     ExcludeOutliers,
     DecideGlobalColorAdjustment,
     ApplyGlobalColorAdjustment,
-    DecideGroupCropRegion,
     ResizeAndMakePaddingWithNaturalPaperColor,
     ResizeAndMakePaddingWithNaturalPaperColor2,
-    DetectTextBoundingBox,
     UnifyCropRegions,
     AddMarginAndClip,  # C# lines 2682-2699 - normalizes crop region
     IsPaperVerticalWriting_GetProbability,
@@ -57,6 +55,8 @@ from .image_processing import (
     remove_show_through,
     remove_margin_background,
     detect_page_edge_junk,
+    decide_group_crop_region_envelope,
+    detect_text_bounding_box,
 )
 
 from .ocr import (
@@ -993,9 +993,17 @@ def _perform_pages_yohaku(
         page.color_adj_file_path = color_adj_path
         tm['save'] = time.perf_counter() - _t
 
-        # Detect bounding box (Cython - uses OpenCV which releases GIL internally)
+        # Detect bounding box. The C# algorithm blanks a 1% border before
+        # measuring, which caps the measurable extent ~50px inside the image;
+        # when margin whitening already cleaned the margins (so edge junk is
+        # gone but real text may legitimately reach near the page edge, e.g.
+        # gutter-side body text), blank only 2px or the crop would slice the
+        # outermost glyph column.
         _t = time.perf_counter()
-        bbox = DetectTextBoundingBox(adjusted)
+        bbox = detect_text_bounding_box(
+            adjusted,
+            border_px=None if options.disable_margin_whitening else 2,
+        )
         tm['bbox'] = time.perf_counter() - _t
         page.bounding_box = bbox
         if options.debug:
@@ -1087,9 +1095,13 @@ def _perform_pages_yohaku(
     # =========================================================================
     report(0, total_pages, "Phase 4.4: Deciding crop regions...")
 
-    # Cython DecideGroupCropRegion returns (left, top, width, height) tuple
-    odd_crop_raw = DecideGroupCropRegion(odd_bboxes)
-    even_crop_raw = DecideGroupCropRegion(even_bboxes)
+    # Use the inlier *envelope* (not the C# median) so the shared crop never
+    # slices off the outermost text column of any page whose text reaches the
+    # group's common extent while still dropping figure/junk outlier bboxes.
+    # The median crop places its right edge at the median text extent, cutting
+    # every page that reaches the gutter-side maximum (right-edge text loss).
+    odd_crop_raw = decide_group_crop_region_envelope(odd_bboxes)
+    even_crop_raw = decide_group_crop_region_envelope(even_bboxes)
 
     # With margin whitening active, the crop shrinks to the bare text, so the
     # output would lose its margins entirely. Re-grant margins equal to the
