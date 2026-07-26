@@ -85,6 +85,11 @@ Examples:
     # Show-through (bleed-through) removal - on for all pages by default (grayscale output)
     parser.add_argument('--no-bleed-removal', action='store_true',
                         help='Disable show-through/background removal for all pages')
+    parser.add_argument('--geometry', type=str, default=None, metavar='FILE',
+                        help='Page geometry sidecar (crop windows, output size, page-number '
+                             'alignment). A normal run writes it; a --no-bleed-removal run '
+                             'reads it back and reuses those decisions, so a colour pass frames '
+                             'its pages exactly like the grayscale pass it was recorded from')
     parser.add_argument('--bleed-removal-exclude-pages', type=str, default=None,
                         help='Page numbers (1-indexed; 000.JPG is page 1) to skip show-through removal, e.g. "1,4,7-9" '
                              '(they keep standard color adjustment, e.g. color/photo pages)')
@@ -192,6 +197,7 @@ Examples:
         no_deskew=args.no_deskew,
         deskew_exclude_pages=deskew_exclude_pages,
         no_bleed_removal=args.no_bleed_removal,
+        geometry_path=args.geometry,
         bleed_removal_exclude_pages=bleed_removal_exclude_pages,
         bleed_bg_ksize=args.bleed_bg_ksize,
         bleed_black_point=args.bleed_black_point,

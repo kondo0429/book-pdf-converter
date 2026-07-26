@@ -1461,6 +1461,98 @@ def apply_global_color_adjustment_fast(image: np.ndarray, param: GlobalColorPara
 # =============================================================================
 # (C) Bounding Box Detection
 # =============================================================================
+def detect_page_area(image: np.ndarray, cov_frac: float = 0.5,
+                     ds: int = 4) -> Optional[Tuple[int, int, int, int]]:
+    """Detect the paper (page) region of a camera-scan page.
+
+    Book-scanner shots put the sheet on a dark stand, so the paper is the one
+    large bright blob. Measured on the pre-adjustment image, where the stand is
+    still solid dark (the show-through flat-field would wash it out).
+
+    The blob's raw bounding box is unreliable on its own: the gutter often does
+    not break the mask, so a sliver of the facing page stays connected, and the
+    curled-down page foot adds a dark fringe. Columns/rows are therefore kept
+    only where the blob covers at least `cov_frac` of its own maximum extent,
+    and the widest contiguous run of those is taken - a partial-height sliver
+    and the gutter dip both fall away.
+
+    Returns (x, y, w, h) in image coordinates, or None when no page is found.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape[:2]
+    small = cv2.resize(gray, (max(1, w // ds), max(1, h // ds)),
+                       interpolation=cv2.INTER_AREA)
+    _, mask = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if num < 2:
+        return None
+    big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    blob = labels == big
+
+    def widest_run(profile: np.ndarray) -> Optional[Tuple[int, int]]:
+        idx = np.nonzero(profile >= profile.max() * cov_frac)[0]
+        if not len(idx):
+            return None
+        brk = np.nonzero(np.diff(idx) > 1)[0]
+        starts = np.concatenate(([0], brk + 1))
+        ends = np.concatenate((brk, [len(idx) - 1]))
+        k = int(np.argmax(ends - starts))
+        return int(idx[starts[k]]), int(idx[ends[k]])
+
+    cols = widest_run(blob.sum(axis=0).astype(np.float32))
+    rows = widest_run(blob.sum(axis=1).astype(np.float32))
+    if cols is None or rows is None:
+        return None
+    x0, x1 = cols
+    y0, y1 = rows
+
+    # Only a shot of a sheet lying on a dark stand can be measured this way.
+    # On a borderless scan (a page already cropped to the paper, e.g. extracted
+    # from a PDF) the whole frame is paper, Otsu then splits ink from paper and
+    # the "page" it returns is a meaningless sliver. Require a genuinely darker
+    # surround of plausible size, otherwise report no page.
+    sel = np.zeros(small.shape[:2], dtype=bool)
+    sel[y0:y1 + 1, x0:x1 + 1] = True
+    frac = float(sel.mean())
+    if frac < 0.2 or frac > 0.97:
+        return None
+    if float(small[~sel].mean()) > float(small[sel].mean()) - 40:
+        return None
+
+    return (x0 * ds, y0 * ds, (x1 - x0 + 1) * ds, (y1 - y0 + 1) * ds)
+
+
+def page_area_anchor(area: Tuple[int, int, int, int], img_width: int,
+                     edge_tol: int = 8) -> Tuple[int, int, bool]:
+    """Reduce a page area to the stable anchor to align crops on.
+
+    Only one vertical page edge is trustworthy: the fore-edge, a clean
+    paper-to-stand boundary. The gutter side is unusable - it carries the
+    spine shadow and often a connected sliver of the facing page, and in these
+    scans the sheet runs past the frame there, so the measured edge is just
+    where the photo stops. That clipped side is exactly how the fore-edge is
+    identified: whichever vertical edge does NOT sit on the frame border.
+
+    Returns (anchor_x, anchor_y, anchor_is_right) where anchor_x is the
+    fore-edge X and anchor_y the (clean) paper top.
+    """
+    x, y, w, _ = area
+    touches_left = x <= edge_tol
+    touches_right = (x + w) >= img_width - edge_tol
+    # Fore-edge is the side away from the clipped/gutter side; when neither or
+    # both are clipped, fall back to the wider-margin side.
+    if touches_left and not touches_right:
+        anchor_is_right = True
+    elif touches_right and not touches_left:
+        anchor_is_right = False
+    else:
+        anchor_is_right = (img_width - (x + w)) < x
+    return ((x + w - 1) if anchor_is_right else x, y, anchor_is_right)
+
+
 def detect_text_bounding_box(image: np.ndarray,
                              border_px: Optional[int] = None) -> Tuple[int, int, int, int]:
     """

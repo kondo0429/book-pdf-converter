@@ -57,6 +57,8 @@ from .image_processing import (
     detect_page_edge_junk,
     decide_group_crop_region_envelope,
     detect_text_bounding_box,
+    detect_page_area,
+    page_area_anchor,
 )
 
 from .ocr import (
@@ -168,6 +170,17 @@ class ConversionOptions:
     # (the CLI truncates the file at startup)
     debug_log_path: Optional[str] = None
 
+    # Sidecar file recording the page geometry decided for a run: the crop
+    # window of every page, the shared output size and window placement, and
+    # the OCR page-number alignment. A normal run writes it; a
+    # --no-bleed-removal run reads it back and reuses those decisions instead
+    # of deriving its own. Show-through removal flattens the paper to white,
+    # which is what makes the sheet, the text extent and the page number
+    # reliably measurable; without it the same page yields a different crop and
+    # a different page-number height, so a colour pass would not line up with
+    # the grayscale one. Reusing the file also skips the OCR pass.
+    geometry_path: Optional[str] = None
+
 
 @dataclass
 class PageInfo:
@@ -182,6 +195,16 @@ class PageInfo:
     # Text extent (left, top, right, bottom) from margin whitening; the band
     # widths outside it are the cleared page-edge area of this page
     margin_extent: Optional[Tuple[int, int, int, int]] = None
+    # Detected paper region (x, y, w, h) and the fore-edge anchor derived from
+    # it: (anchor_x, anchor_y, anchor_is_right). Used to place the shared-size
+    # crop window on each page so it tracks the sheet as the book's thickness
+    # shifts it across the shoot.
+    page_area: Optional[Tuple[int, int, int, int]] = None
+    page_anchor: Optional[Tuple[int, int, bool]] = None
+    # Final crop window for this page (x, y, w, h). Every page gets the same
+    # w/h - only the position follows the sheet - so the output scale, and
+    # therefore the character size, is identical on every page.
+    crop_rect: Optional[Tuple[int, int, int, int]] = None
     # Per-page debug records (filled when options.debug is enabled)
     debug_info: dict = field(default_factory=dict)
 
@@ -198,26 +221,80 @@ class ConversionResult:
     logical_page_start: Optional[int] = None
 
 
-def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-    """Fit a processed page onto a white canvas of the source image's size.
+def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int,
+                        top_frac: Optional[float] = None) -> np.ndarray:
+    """Scale a processed page up until it matches the source's width or height.
 
-    The pipeline crops the page, so its aspect ratio differs slightly from the
-    source; scale to fit (no distortion) and center on white - the page
-    background is white anyway, so the padding is invisible. Returns the image
-    unchanged when it already has the target size.
+    Cropping to the page leaves an aspect ratio taller and narrower than the
+    camera frame, so fitting the page *inside* the source size would shrink it
+    and band the sides with white. Scale by the larger of the two ratios
+    instead, so the page meets the source on whichever axis binds first and
+    fills the frame with no padding. The other axis is allowed to exceed the
+    source rather than being cropped back to it - cropping would cut text off
+    the page. Returns the image unchanged when it already has the target size.
     """
     oh, ow = image.shape[:2]
     if (ow, oh) == (target_w, target_h):
         return image
-    fit = min(target_w / ow, target_h / oh)
-    nw = max(1, int(round(ow * fit)))
-    nh = max(1, int(round(oh * fit)))
+
+    if top_frac is None:
+        # No page-area crop measured the print, so the page carries no slack to
+        # give up - the crop is already the text plus even margins. Scaling it
+        # up to fill would have to trim into the print (the running head goes
+        # first). Fit inside instead and centre on white; the page background is
+        # white anyway, so the padding is invisible.
+        fit = min(target_w / ow, target_h / oh)
+        nw = max(1, int(round(ow * fit)))
+        nh = max(1, int(round(oh * fit)))
+        resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+        canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+        y0 = (target_h - nh) // 2
+        x0 = (target_w - nw) // 2
+        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+        return canvas
+
+    fill = max(target_w / ow, target_h / oh)
+    nw = max(1, int(round(ow * fill)))
+    nh = max(1, int(round(oh * fill)))
     resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
-    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-    x0 = (target_w - nw) // 2
-    y0 = (target_h - nh) // 2
-    canvas[y0:y0 + nh, x0:x0 + nw] = resized
-    return canvas
+    if (nw, nh) == (target_w, target_h):
+        return resized
+
+    # Scaling to fill overshoots on one axis; cut that back to the source size
+    # rather than handing back a taller page. The overshoot is the slack the
+    # page crop carries beyond the print - mostly the blank below the page
+    # number - so the window is placed to start just above the print instead of
+    # at a fixed edge, which would trim the page number off the bottom.
+    #
+    # top_frac must be one figure for the whole book (per parity), not each
+    # page's own ink: a page carrying less ink would otherwise shift its window
+    # and print its page number at a different height from the facing page.
+    over_y = nh - target_h
+    over_x = nw - target_w
+    y0 = int(min(max(round(top_frac * nh), 0), over_y)) if over_y > 0 else 0
+    x0 = over_x // 2
+    return resized[y0:y0 + target_h, x0:x0 + target_w]
+
+
+def _write_geometry(path: str, data: dict) -> None:
+    """Record the page geometry of this run for a later pass to reuse."""
+    import json
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+def _read_geometry(path: str) -> Optional[dict]:
+    """Load a geometry sidecar, or None when it is missing or unreadable."""
+    import json
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get('pages') else None
 
 
 def _read_jpeg_dpi(path: str | Path) -> Optional[Tuple[float, float]]:
@@ -435,6 +512,10 @@ def convert_pdf(
             if f.endswith('.png')
         ])
 
+        # Shared per-parity window placement for the fit below, so the page
+        # number lands at the same height on every page of a spread.
+        fit_top_frac = result.get('fit_top_frac') or {}
+
         def load_final_images():
             for idx, path in enumerate(output_files):
                 img = cv2.imread(path)
@@ -444,7 +525,9 @@ def convert_pdf(
                 # the same physical page size) as the input.
                 if idx < len(src_sizes):
                     tw, th = src_sizes[idx]
-                    img = _fit_to_source_size(img, tw, th)
+                    img = _fit_to_source_size(
+                        img, tw, th,
+                        top_frac=fit_top_frac.get((idx + 1) % 2 == 1))
                 yield cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # Embed at the extraction DPI: pages were rendered from the source at
@@ -665,6 +748,10 @@ def convert_images(
             page_numbers=page_numbers,
         )
 
+        # Shared per-parity window placement for the fit below, so the page
+        # number lands at the same height on every page of a spread.
+        fit_top_frac = result.get('fit_top_frac') or {}
+
         # =====================================================================
         # STEP 4: Save processed pages as JPEGs under the original names
         # =====================================================================
@@ -681,7 +768,9 @@ def convert_images(
 
             # Fit the processed page back to the input file's pixel size, so
             # each output JPEG has exactly the same dimensions as its input.
-            image = _fit_to_source_size(image, *src_sizes[idx])
+            image = _fit_to_source_size(
+                image, *src_sizes[idx],
+                top_frac=fit_top_frac.get(num % 2 == 1))
 
             _save_jpeg_with_dpi(
                 str(output_dir / name), image,
@@ -926,6 +1015,16 @@ def _perform_pages_yohaku(
                 img_rgb, debug_out=junk_dbg if options.debug else None)
         tm['junk'] = time.perf_counter() - _t
 
+        # Locate the sheet itself on the (still dark) stand, so Phase 4 can cut
+        # every page to the same page-sized window instead of to wherever that
+        # page's text happens to reach.
+        _t = time.perf_counter()
+        area = detect_page_area(img_rgb)
+        if area is not None:
+            page.page_area = area
+            page.page_anchor = page_area_anchor(area, img_rgb.shape[1])
+        tm['pagearea'] = time.perf_counter() - _t
+
         # Show-through removal runs on all pages by default; skip if globally
         # disabled or this page is excluded (excluded pages keep the standard
         # global color adjustment).
@@ -1095,58 +1194,182 @@ def _perform_pages_yohaku(
     # =========================================================================
     report(0, total_pages, "Phase 4.4: Deciding crop regions...")
 
-    # Use the inlier *envelope* (not the C# median) so the shared crop never
+    # Preferred path: cut every page to one page-sized window located from the
+    # sheet itself. Sizing the crop from the text bbox instead makes the frame
+    # depend on how much text a page carries, so a chapter opener gets a very
+    # different margin layout from a full page. One shared size also pins the
+    # scale, keeping the character size identical across the book, while the
+    # per-page position absorbs the sheet drifting as the book's thickness
+    # shifts across the shoot.
+    W, H = INTERNAL_HIGH_RES_WIDTH, INTERNAL_HIGH_RES_HEIGHT
+    fit_top_frac: dict = {}
+
+    # A --no-bleed-removal pass reuses the geometry a normal pass recorded: on
+    # a page whose paper was not flattened to white, the sheet, the text extent
+    # and the page number all measure differently, so deriving geometry here
+    # would frame the page differently from the grayscale output.
+    geom = None
+    if options.geometry_path and options.no_bleed_removal:
+        geom = _read_geometry(options.geometry_path)
+        if geom is None:
+            dbg(f"geometry file not usable ({options.geometry_path}) -> "
+                f"deciding geometry from these pages instead")
+
+    if geom is not None:
+        by_num = {int(k): v for k, v in geom['pages'].items()}
+        applied = 0
+        for p in page_infos:
+            rec = by_num.get(p.page_number)
+            if rec and rec.get('crop_rect'):
+                p.crop_rect = tuple(rec['crop_rect'])
+                applied += 1
+        fit_top_frac[True] = fit_top_frac[False] = float(geom.get('fit_top_frac', 0.0))
+        rects = [p.crop_rect for p in page_infos if p.crop_rect]
+        odd_crop = even_crop = rects[0] if rects else (0, 0, W, H)
+        dbg(f"geometry loaded from {options.geometry_path}: crop applied to "
+            f"{applied}/{len(page_infos)} pages, size={geom.get('crop_size')}, "
+            f"output={geom.get('output_size')}, mode={geom.get('mode')}")
+
+    use_geometry = geom is not None
+    anchored = [p for p in page_infos if p.page_anchor and p.page_area]
+    # Demand the sheet on nearly every page. A shoot on a stand yields it on
+    # all of them; a scan that only sometimes looks like one is not a stand
+    # shoot, and letting a partial detection take over would re-frame a book
+    # that the text-bbox crop already handles well.
+    use_page_area = (not use_geometry
+                     and len(anchored) >= max(3, int(len(page_infos) * 0.8)))
+
+    if use_page_area:
+        # Vertical placement does not drift (the rig is fixed), and the paper
+        # top is occasionally mis-measured, so take one robust top per parity
+        # rather than tracking it page by page.
+        top_of = {}
+        for is_odd in (True, False):
+            tops = [p.page_area[1] for p in anchored if p.is_odd == is_odd]
+            top_of[is_odd] = int(np.median(tops)) if tops else 0
+
+        # The sheet runs past the frame on the gutter side, so the usable width
+        # is fore-edge -> frame edge. Take a low percentile as the shared width
+        # so the window stays inside the image on essentially every page.
+        avail_w, avail_h = [], []
+        for p in anchored:
+            ax, _, right = p.page_anchor
+            avail_w.append(ax + 1 if right else W - ax)
+            avail_h.append(H - top_of[p.is_odd])
+        crop_w = max(1, int(np.percentile(avail_w, 5)))
+        crop_h = max(1, min(avail_h))
+
+    # A window far smaller than the frame means the detections disagreed about
+    # where the sheet is; the text-bbox crop is the safer answer then.
+    if use_page_area and (crop_w < W * 0.3 or crop_h < H * 0.3):
+        dbg(f"crop from page area REJECTED: window {crop_w}x{crop_h} px is too "
+            f"small for a {W}x{H} frame -> falling back to text-bbox crop")
+        use_page_area = False
+
+    if use_page_area:
+        for p in page_infos:
+            top = top_of[p.is_odd]
+            if p.page_anchor:
+                ax, _, right = p.page_anchor
+                x0 = ax - crop_w + 1 if right else ax
+            else:
+                # No detection: fall back to this parity's median position.
+                med = [q.page_anchor[0] for q in anchored if q.is_odd == p.is_odd]
+                ax = int(np.median(med)) if med else 0
+                right = next((q.page_anchor[2] for q in anchored
+                              if q.is_odd == p.is_odd), False)
+                x0 = ax - crop_w + 1 if right else ax
+            x0 = max(0, min(x0, W - crop_w))
+            y0 = max(0, min(top, H - crop_h))
+            p.crop_rect = (x0, y0, crop_w, crop_h)
+
+        # Where the print sits inside the window. The window is taller than the
+        # source frame, so the output stage trims the overshoot; deciding that
+        # from each page's own ink would move the window by however much ink
+        # that page happens to carry, and the page number would sit at a
+        # different height from the facing page.
+        #
+        # One figure covers the whole book rather than one per parity. The
+        # windows of both parities already sit at the same height against the
+        # paper, so a shared figure lands the page number at the same height on
+        # facing pages; a per-parity figure would instead line up the *tops* of
+        # the print, and any difference there (a running head on one side only)
+        # would push the page numbers apart by that much. Measured from the
+        # text extent found during margin whitening.
+        fr = [(p.margin_extent[1] - p.crop_rect[1]) / p.crop_rect[3]
+              for p in page_infos if p.margin_extent and p.crop_rect]
+        shared = float(np.median(fr)) if fr else 0.0
+        fit_top_frac[True] = fit_top_frac[False] = shared
+
+        odd_rects = [p.crop_rect for p in page_infos if p.is_odd and p.crop_rect]
+        even_rects = [p.crop_rect for p in page_infos if not p.is_odd and p.crop_rect]
+        odd_crop = odd_rects[0] if odd_rects else (0, 0, crop_w, crop_h)
+        even_crop = even_rects[0] if even_rects else (0, 0, crop_w, crop_h)
+
+        def _xs(rects):
+            return [r[0] for r in rects] or [0]
+
+        dbg(f"crop from page area: size={crop_w}x{crop_h} px (shared by every "
+            f"page -> identical scale/character size) | anchored "
+            f"{len(anchored)}/{len(page_infos)} pages | "
+            f"odd top={top_of[True]} x={min(_xs(odd_rects))}..{max(_xs(odd_rects))}, "
+            f"even top={top_of[False]} x={min(_xs(even_rects))}..{max(_xs(even_rects))}")
+
+    # Fallback (no page detected, e.g. borderless scans): keep the text-bbox
+    # crop. Use the inlier *envelope* (not the C# median) so the shared crop never
     # slices off the outermost text column of any page whose text reaches the
     # group's common extent while still dropping figure/junk outlier bboxes.
     # The median crop places its right edge at the median text extent, cutting
     # every page that reaches the gutter-side maximum (right-edge text loss).
-    odd_crop_raw = decide_group_crop_region_envelope(odd_bboxes)
-    even_crop_raw = decide_group_crop_region_envelope(even_bboxes)
+    if not use_page_area and not use_geometry:
+        odd_crop_raw = decide_group_crop_region_envelope(odd_bboxes)
+        even_crop_raw = decide_group_crop_region_envelope(even_bboxes)
 
-    # With margin whitening active, the crop shrinks to the bare text, so the
-    # output would lose its margins entirely. Re-grant margins equal to the
-    # median cleared page-edge band on each side (the area between the text
-    # and the page edge in the pre-whitening image). The same four margins are
-    # applied to both groups, so odd and even pages share the same top margin
-    # and their text starts at the same height.
-    margin_extents = [p.margin_extent for p in page_infos if p.margin_extent]
-    use_band_margins = not options.disable_margin_whitening and len(margin_extents) > 0
+        # With margin whitening active, the crop shrinks to the bare text, so
+        # the output would lose its margins entirely. Re-grant margins equal to
+        # the median cleared page-edge band on each side (the area between the
+        # text and the page edge in the pre-whitening image). The same four
+        # margins are applied to both groups, so odd and even pages share the
+        # same top margin and their text starts at the same height.
+        margin_extents = [p.margin_extent for p in page_infos if p.margin_extent]
+        use_band_margins = (not options.disable_margin_whitening
+                            and len(margin_extents) > 0)
 
-    # Unify crop regions (Cython); with band margins the percent margin is
-    # replaced by the band-based expansion below
-    odd_crop, even_crop = UnifyCropRegions(
-        odd_crop_raw, even_crop_raw,
-        0 if use_band_margins else options.margin_percent,
-        INTERNAL_HIGH_RES_WIDTH,
-        INTERNAL_HIGH_RES_HEIGHT,
-    )
+        # Unify crop regions (Cython); with band margins the percent margin is
+        # replaced by the band-based expansion below
+        odd_crop, even_crop = UnifyCropRegions(
+            odd_crop_raw, even_crop_raw,
+            0 if use_band_margins else options.margin_percent,
+            INTERNAL_HIGH_RES_WIDTH,
+            INTERNAL_HIGH_RES_HEIGHT,
+        )
 
-    if use_band_margins:
-        W, H = INTERNAL_HIGH_RES_WIDTH, INTERNAL_HIGH_RES_HEIGHT
-        band_l = int(np.median([e[0] for e in margin_extents]))
-        band_t = int(np.median([e[1] for e in margin_extents]))
-        band_r = int(np.median([W - e[2] for e in margin_extents]))
-        band_b = int(np.median([H - e[3] for e in margin_extents]))
+        if use_band_margins:
+            band_l = int(np.median([e[0] for e in margin_extents]))
+            band_t = int(np.median([e[1] for e in margin_extents]))
+            band_r = int(np.median([W - e[2] for e in margin_extents]))
+            band_b = int(np.median([H - e[3] for e in margin_extents]))
 
-        # Clamp jointly so both crops stay inside the image with identical
-        # dimensions (unequal clamping would give the groups different scales)
-        m_l = min(band_l, odd_crop[0], even_crop[0])
-        m_t = min(band_t, odd_crop[1], even_crop[1])
-        m_r = min(band_r,
-                  W - (odd_crop[0] + odd_crop[2]),
-                  W - (even_crop[0] + even_crop[2]))
-        m_b = min(band_b,
-                  H - (odd_crop[1] + odd_crop[3]),
-                  H - (even_crop[1] + even_crop[3]))
+            # Clamp jointly so both crops stay inside the image with identical
+            # dimensions (unequal clamping would give the groups different scales)
+            m_l = min(band_l, odd_crop[0], even_crop[0])
+            m_t = min(band_t, odd_crop[1], even_crop[1])
+            m_r = min(band_r,
+                      W - (odd_crop[0] + odd_crop[2]),
+                      W - (even_crop[0] + even_crop[2]))
+            m_b = min(band_b,
+                      H - (odd_crop[1] + odd_crop[3]),
+                      H - (even_crop[1] + even_crop[3]))
 
-        odd_crop = (odd_crop[0] - m_l, odd_crop[1] - m_t,
-                    odd_crop[2] + m_l + m_r, odd_crop[3] + m_t + m_b)
-        even_crop = (even_crop[0] - m_l, even_crop[1] - m_t,
-                     even_crop[2] + m_l + m_r, even_crop[3] + m_t + m_b)
+            odd_crop = (odd_crop[0] - m_l, odd_crop[1] - m_t,
+                        odd_crop[2] + m_l + m_r, odd_crop[3] + m_t + m_b)
+            even_crop = (even_crop[0] - m_l, even_crop[1] - m_t,
+                         even_crop[2] + m_l + m_r, even_crop[3] + m_t + m_b)
 
-        dbg(f"crop margins: median cleared bands L={band_l} T={band_t} R={band_r} B={band_b} px; "
-            f"re-granted (after joint clamping) L={m_l} T={m_t} R={m_r} B={m_b} px "
-            f"(shared by odd/even -> same text start height)")
+            dbg(f"crop margins: median cleared bands L={band_l} T={band_t} "
+                f"R={band_r} B={band_b} px; re-granted (after joint clamping) "
+                f"L={m_l} T={m_t} R={m_r} B={m_b} px "
+                f"(shared by odd/even -> same text start height)")
 
     # Calculate final dimensions
     crop_width = max(odd_crop[2], even_crop[2])
@@ -1154,13 +1377,21 @@ def _perform_pages_yohaku(
 
     final_height = FINAL_TARGET_HEIGHT
     final_width = crop_width * final_height // crop_height if crop_height > 0 else crop_width
+    if use_geometry and geom.get('output_size'):
+        # Take the recorded size verbatim, so this pass scales its pages by
+        # exactly the factor the recorded pass used.
+        final_width, final_height = (int(v) for v in geom['output_size'])
 
-    dbg(f"crop odd : raw={tuple(odd_crop_raw)} -> final=(x={odd_crop[0]}, y={odd_crop[1]}, "
-        f"w={odd_crop[2]}, h={odd_crop[3]})")
-    dbg(f"crop even: raw={tuple(even_crop_raw)} -> final=(x={even_crop[0]}, y={even_crop[1]}, "
-        f"w={even_crop[2]}, h={even_crop[3]})")
-    dbg(f"output size: {final_width}x{final_height} px "
-        f"({'band margins' if use_band_margins else f'margin_percent={options.margin_percent}%'})")
+    if not use_page_area and not use_geometry:
+        dbg(f"crop odd : raw={tuple(odd_crop_raw)} -> final=(x={odd_crop[0]}, "
+            f"y={odd_crop[1]}, w={odd_crop[2]}, h={odd_crop[3]})")
+        dbg(f"crop even: raw={tuple(even_crop_raw)} -> final=(x={even_crop[0]}, "
+            f"y={even_crop[1]}, w={even_crop[2]}, h={even_crop[3]})")
+    mode = ('reused geometry' if use_geometry else
+            'page area' if use_page_area else
+            ('band margins' if use_band_margins
+             else f'margin_percent={options.margin_percent}%'))
+    dbg(f"output size: {final_width}x{final_height} px ({mode})")
 
 
     # =========================================================================
@@ -1168,25 +1399,71 @@ def _perform_pages_yohaku(
     # =========================================================================
     report(0, total_pages, "Phase 4.5: Detecting page numbers...")
 
-    # Load all color-adjusted images for OCR
-    ocr_images = []
-    for idx, page in enumerate(page_infos):
-        img_bgr = cv2.imread(page.color_adj_file_path)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        ocr_images.append(img_rgb)
+    if use_geometry:
+        # The recorded pass already read the page numbers off flattened paper;
+        # re-reading them here would give different shifts and move the page
+        # number to a different height than the recorded output.
+        by_num = {int(k): v for k, v in geom['pages'].items()}
+        ocr_results = []
+        for p in page_infos:
+            rec = by_num.get(p.page_number) or {}
+            ocr_results.append(PageNumberResult(
+                detected_number=rec.get('page_number_detected'),
+                shift_x=int(rec.get('shift_x', 0)),
+                shift_y=int(rec.get('shift_y', 0)),
+            ))
+        dbg(f"page numbers reused from {options.geometry_path} "
+            f"(OCR skipped): {sum(1 for r in ocr_results if r.detected_number)} "
+            f"of {len(ocr_results)} pages carry a detected number")
+    else:
+        # Load all color-adjusted images for OCR
+        ocr_images = []
+        for idx, page in enumerate(page_infos):
+            img_bgr = cv2.imread(page.color_adj_file_path)
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            ocr_images.append(img_rgb)
 
-    # C# lines 3229-3620: Sophisticated cross-page validation for page numbers
-    # This collects ALL number candidates per page, then uses cross-validation
-    # to identify which numbers are actual page numbers (must increment sequentially)
-    ocr_results = calculate_page_alignment_shifts_v2(
-        ocr_images,
-        INTERNAL_HIGH_RES_WIDTH,
-        INTERNAL_HIGH_RES_HEIGHT,
-        progress_callback=report,
-    )
+        # C# lines 3229-3620: Sophisticated cross-page validation for page numbers
+        # This collects ALL number candidates per page, then uses cross-validation
+        # to identify which numbers are actual page numbers (must increment sequentially)
+        ocr_results = calculate_page_alignment_shifts_v2(
+            ocr_images,
+            INTERNAL_HIGH_RES_WIDTH,
+            INTERNAL_HIGH_RES_HEIGHT,
+            progress_callback=report,
+        )
 
     # Find page number offset
     page_offset = find_page_number_offset(ocr_results)
+
+    # Record what this pass decided, so a --no-bleed-removal pass can frame its
+    # pages identically. Skipped when this pass was itself driven by the file.
+    if options.geometry_path and not use_geometry:
+        pages_rec = {}
+        for idx, p in enumerate(page_infos):
+            r = ocr_results[idx] if idx < len(ocr_results) else None
+            pages_rec[str(p.page_number)] = {
+                'crop_rect': list(p.crop_rect) if p.crop_rect else None,
+                'group_crop': list(odd_crop if p.is_odd else even_crop),
+                'shift_x': int(r.shift_x) if r else 0,
+                'shift_y': int(r.shift_y) if r else 0,
+                'page_number_detected': (r.detected_number if r else None),
+                'page_number_bbox': (list(r.bbox) if r and r.bbox else None),
+                'text_extent': list(p.margin_extent) if p.margin_extent else None,
+            }
+        try:
+            _write_geometry(options.geometry_path, {
+                'mode': mode,
+                'crop_size': [crop_width, crop_height],
+                'output_size': [final_width, final_height],
+                'fit_top_frac': fit_top_frac.get(True, 0.0),
+                'internal_size': [W, H],
+                'pages': pages_rec,
+            })
+            dbg(f"geometry written to {options.geometry_path} "
+                f"({len(pages_rec)} pages, mode={mode})")
+        except OSError as e:
+            dbg(f"could not write geometry to {options.geometry_path}: {e}")
 
     # Determine physical/logical page shift
     physical_page_start = None
@@ -1249,8 +1526,10 @@ def _perform_pages_yohaku(
             img_bgr = cv2.imread(page.color_adj_file_path)
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-            # Get crop region for this page
-            crop_region = odd_crop if page.is_odd else even_crop
+            # Get crop region for this page. With page-area cropping every page
+            # carries its own window - same size everywhere, position tracking
+            # that page's sheet - so fall back to the group rect only without it.
+            crop_region = page.crop_rect or (odd_crop if page.is_odd else even_crop)
 
             # C# line 1912: Normalize crop region with AddMarginAndClip
             # This clamps to image bounds and uses right-left+1 for width
@@ -1327,4 +1606,7 @@ def _perform_pages_yohaku(
         'page_offset': page_offset,
         'physical_page_start': physical_page_start,
         'logical_page_start': logical_page_start,
+        # Per-parity share of the page height that sits above the print, so the
+        # output stage trims the overshoot the same way on every page.
+        'fit_top_frac': fit_top_frac,
     }
