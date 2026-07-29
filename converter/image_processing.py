@@ -1517,9 +1517,16 @@ def detect_page_area(image: np.ndarray, cov_frac: float = 0.5,
     sel = np.zeros(small.shape[:2], dtype=bool)
     sel[y0:y1 + 1, x0:x1 + 1] = True
     frac = float(sel.mean())
-    if frac < 0.2 or frac > 0.97:
+    # The darker surround is what tells a stand shot from a borderless scan
+    # (that difference runs to ~105 here against a bar of 40), so the area
+    # bound only has to leave enough surround to measure. Any tighter and it
+    # starts rejecting sheets that merely fill more of the frame - which on one
+    # book dropped the detection rate below the threshold for page-area
+    # cropping and quietly sent the whole run down the old path.
+    if frac < 0.2 or frac > 0.998:
         return None
-    if float(small[~sel].mean()) > float(small[sel].mean()) - 40:
+    outside = small[~sel]
+    if outside.size < 64 or float(outside.mean()) > float(small[sel].mean()) - 40:
         return None
 
     return (x0 * ds, y0 * ds, (x1 - x0 + 1) * ds, (y1 - y0 + 1) * ds)

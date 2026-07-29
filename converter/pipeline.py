@@ -74,6 +74,18 @@ INTERNAL_HIGH_RES_WIDTH = get_internal_high_res_width()
 INTERNAL_HIGH_RES_HEIGHT = get_internal_high_res_height()
 FINAL_TARGET_HEIGHT = get_final_target_height()
 
+# Margin left around the print when a page is grown to fill its frame,
+# as a fraction of the frame's shorter side.
+_PRINT_MARGIN_FRAC = 0.03
+
+# Percentile of the per-page print size that the scale is fitted to. Pages
+# above it spend their margin and may lose a little off the ends.
+_PRINT_FIT_PCT = 85
+
+# How much the detected sheet width may vary across a book before the
+# detections are treated as incidental rather than one sheet reshot.
+_PAGE_AREA_MAX_CV = 0.05
+
 
 @dataclass
 class ConversionOptions:
@@ -222,7 +234,7 @@ class ConversionResult:
 
 
 def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int,
-                        top_frac: Optional[float] = None) -> np.ndarray:
+                        top_frac: Optional[dict] = None) -> np.ndarray:
     """Scale a processed page up until it matches the source's width or height.
 
     Cropping to the page leaves an aspect ratio taller and narrower than the
@@ -254,6 +266,25 @@ def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int,
         return canvas
 
     fill = max(target_w / ow, target_h / oh)
+
+    # Filling the frame with the crop window wastes whatever of that window is
+    # margin rather than print - here about a quarter of the width - and it
+    # leaves the print wherever it happens to sit, which came out pressed
+    # against the top. Scale by what makes the *print* fill the frame, down to
+    # an even margin, and the page grows into that slack. One set of print
+    # bounds covers the whole book, so this stays a single scale factor and the
+    # character size is still identical on every page. Never below `fill`, or
+    # the frame would band with white again.
+    box = None
+    if top_frac and top_frac.get('max_h') and top_frac.get('max_w'):
+        m = _PRINT_MARGIN_FRAC * min(target_w, target_h)
+        pw = top_frac['max_w'] * ow * fill
+        ph = top_frac['max_h'] * oh * fill
+        if pw > 1 and ph > 1:
+            fill *= max(1.0, min((target_w - 2 * m) / pw,
+                                 (target_h - 2 * m) / ph))
+            box = top_frac
+
     nw = max(1, int(round(ow * fill)))
     nh = max(1, int(round(oh * fill)))
     resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
@@ -269,10 +300,19 @@ def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int,
     # top_frac must be one figure for the whole book (per parity), not each
     # page's own ink: a page carrying less ink would otherwise shift its window
     # and print its page number at a different height from the facing page.
-    over_y = nh - target_h
-    over_x = nw - target_w
-    y0 = int(min(max(round(top_frac * nh), 0), over_y)) if over_y > 0 else 0
-    x0 = over_x // 2
+    over_y = max(nh - target_h, 0)
+    over_x = max(nw - target_w, 0)
+    if box is None:
+        y0, x0 = over_y // 2, over_x // 2
+    else:
+        # Centre the frame on the print, so the margin it leaves is even rather
+        # than all falling on one side.
+        def centred(lo_f, hi_f, extent, size, limit):
+            lo, hi = lo_f * extent, hi_f * extent
+            return int(min(max(round((lo + hi - size) / 2), 0), limit))
+
+        y0 = centred(box['top'], box['bottom'], nh, target_h, over_y)
+        x0 = centred(box['left'], box['right'], nw, target_w, over_x)
     return resized[y0:y0 + target_h, x0:x0 + target_w]
 
 
@@ -527,7 +567,7 @@ def convert_pdf(
                     tw, th = src_sizes[idx]
                     img = _fit_to_source_size(
                         img, tw, th,
-                        top_frac=fit_top_frac.get((idx + 1) % 2 == 1))
+                        top_frac=fit_top_frac or None)
                 yield cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # Embed at the extraction DPI: pages were rendered from the source at
@@ -770,7 +810,7 @@ def convert_images(
             # each output JPEG has exactly the same dimensions as its input.
             image = _fit_to_source_size(
                 image, *src_sizes[idx],
-                top_frac=fit_top_frac.get(num % 2 == 1))
+                top_frac=fit_top_frac or None)
 
             _save_jpeg_with_dpi(
                 str(output_dir / name), image,
@@ -887,11 +927,45 @@ def _perform_pages_yohaku(
     odd_color_stats: List[ColorStats] = []
     even_color_stats: List[ColorStats] = []
 
+    def _area_to_internal(area, src_w, src_h, angle):
+        """Carry a source-image page rect into internal high-res coordinates.
+
+        Mirrors ResizeAndMakePaddingWithNaturalPaperColor (fit, then centre)
+        followed by the deskew rotation about the internal centre.
+        """
+        W, H = INTERNAL_HIGH_RES_WIDTH, INTERNAL_HIGH_RES_HEIGHT
+        s = min(W / src_w, H / src_h)
+        ox = (W - src_w * s) / 2.0
+        oy = (H - src_h * s) / 2.0
+        x, y, w, h = area
+        pts = np.array([[x, y], [x + w, y], [x, y + h], [x + w, y + h]],
+                       dtype=np.float64) * s + (ox, oy)
+        if abs(angle) >= 0.001:
+            th = np.radians(angle)
+            c, sn = np.cos(th), np.sin(th)
+            ctr = np.array([W / 2.0, H / 2.0])
+            d = pts - ctr
+            pts = ctr + np.column_stack((d[:, 0] * c - d[:, 1] * sn,
+                                         d[:, 0] * sn + d[:, 1] * c))
+        x0 = max(0, int(round(pts[:, 0].min())))
+        y0 = max(0, int(round(pts[:, 1].min())))
+        x1 = min(W, int(round(pts[:, 0].max())))
+        y1 = min(H, int(round(pts[:, 1].max())))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+
     def process_phase1(page: PageInfo) -> Tuple[PageInfo, ColorStats]:
         """Process a single page for Phase 1 (resize, deskew, color stats)."""
         # Load image
         img_bgr = cv2.imread(page.file_path)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        # Locate the sheet here, on the image as shot. The internal resize pads
+        # to a different aspect with paper colour, and that padding is as bright
+        # as the sheet and touches it, so the bright region spans the whole
+        # internal frame and the stand can no longer be told from the page.
+        src_area = detect_page_area(img_rgb)
 
         # Resize to internal high-res with natural paper padding (Cython with nogil)
         resized = ResizeAndMakePaddingWithNaturalPaperColor(
@@ -905,6 +979,7 @@ def _perform_pages_yohaku(
         # then apply rotation to the resized high-res image.
         # Skip when deskew is disabled globally or this page is excluded.
         exclude_pages = options.deskew_exclude_pages or set()
+        applied_angle = 0.0
         if options.no_deskew:
             deskewed = resized
             page.debug_info['deskew'] = 'deskew SKIPPED (--no-deskew)'
@@ -920,6 +995,7 @@ def _perform_pages_yohaku(
                 raw_out=raw,
             )
             deskewed = apply_deskew_rotation(resized, angle)
+            applied_angle = angle
             raw_s = f'{raw[0]:+.3f}' if raw else 'n/a'
             if abs(angle) < 0.001:
                 if raw and abs(raw[0]) > options.max_deskew_degree:
@@ -931,6 +1007,14 @@ def _perform_pages_yohaku(
             else:
                 page.debug_info['deskew'] = (
                     f'deskew rotated {angle:+.3f} deg (raw={raw_s} deg)')
+
+        if src_area is not None:
+            mapped = _area_to_internal(src_area, img_rgb.shape[1],
+                                       img_rgb.shape[0], applied_angle)
+            if mapped is not None:
+                page.page_area = mapped
+                page.page_anchor = page_area_anchor(
+                    mapped, INTERNAL_HIGH_RES_WIDTH)
 
         # Save deskewed image to tmp
         deskew_path = os.path.join(tmp_dir, f"deskew_{page.page_number:04d}.png")
@@ -1014,16 +1098,6 @@ def _perform_pages_yohaku(
             edge_junk = detect_page_edge_junk(
                 img_rgb, debug_out=junk_dbg if options.debug else None)
         tm['junk'] = time.perf_counter() - _t
-
-        # Locate the sheet itself on the (still dark) stand, so Phase 4 can cut
-        # every page to the same page-sized window instead of to wherever that
-        # page's text happens to reach.
-        _t = time.perf_counter()
-        area = detect_page_area(img_rgb)
-        if area is not None:
-            page.page_area = area
-            page.page_anchor = page_area_anchor(area, img_rgb.shape[1])
-        tm['pagearea'] = time.perf_counter() - _t
 
         # Show-through removal runs on all pages by default; skip if globally
         # disabled or this page is excluded (excluded pages keep the standard
@@ -1223,7 +1297,7 @@ def _perform_pages_yohaku(
             if rec and rec.get('crop_rect'):
                 p.crop_rect = tuple(rec['crop_rect'])
                 applied += 1
-        fit_top_frac[True] = fit_top_frac[False] = float(geom.get('fit_top_frac', 0.0))
+        fit_top_frac = geom.get('print_frac') or {}
         rects = [p.crop_rect for p in page_infos if p.crop_rect]
         odd_crop = even_crop = rects[0] if rects else (0, 0, W, H)
         dbg(f"geometry loaded from {options.geometry_path}: crop applied to "
@@ -1236,8 +1310,32 @@ def _perform_pages_yohaku(
     # all of them; a scan that only sometimes looks like one is not a stand
     # shoot, and letting a partial detection take over would re-frame a book
     # that the text-bbox crop already handles well.
-    use_page_area = (not use_geometry
-                     and len(anchored) >= max(3, int(len(page_infos) * 0.8)))
+    # Some sheets fill the frame edge to edge, leaving no surround to measure,
+    # so a stand shoot does not detect on every page - measured 79% and 100% on
+    # two books, against 58% for a borderless scan that must not take this path.
+    need_anchored = max(3, int(len(page_infos) * 0.7))
+    enough = len(anchored) >= need_anchored
+
+    # Detecting a bright region on most pages is not enough on its own: a scan
+    # that still carries a dark edge answers that test too, and then re-frames a
+    # book the text-bbox crop already handled. What only a stand shoot can show
+    # is the *same sheet* measuring the same width shot after shot, so the
+    # widths must also agree (measured 0.016 across a shoot against 0.086 for a
+    # scan whose detections are incidental).
+    cv_w = None
+    if anchored:
+        widths = np.array([p.page_area[2] for p in anchored], dtype=np.float64)
+        if widths.mean() > 0:
+            cv_w = float(widths.std() / widths.mean())
+    steady = cv_w is not None and cv_w <= _PAGE_AREA_MAX_CV
+
+    use_page_area = not use_geometry and enough and steady
+    if not use_geometry and not use_page_area:
+        why = ('sheet detected on %d/%d pages, needs %d'
+               % (len(anchored), len(page_infos), need_anchored)) if not enough else (
+              'sheet width varies too much across pages (cv=%.3f, allows %.3f)'
+              % (cv_w if cv_w is not None else float('nan'), _PAGE_AREA_MAX_CV))
+        dbg(f"crop from page area NOT used: {why} -> falling back to text-bbox crop")
 
     if use_page_area:
         # Vertical placement does not drift (the rig is fixed), and the paper
@@ -1296,10 +1394,32 @@ def _perform_pages_yohaku(
         # the print, and any difference there (a running head on one side only)
         # would push the page numbers apart by that much. Measured from the
         # text extent found during margin whitening.
-        fr = [(p.margin_extent[1] - p.crop_rect[1]) / p.crop_rect[3]
-              for p in page_infos if p.margin_extent and p.crop_rect]
-        shared = float(np.median(fr)) if fr else 0.0
-        fit_top_frac[True] = fit_top_frac[False] = shared
+        rows = [(p.margin_extent, p.crop_rect) for p in page_infos
+                if p.margin_extent and p.crop_rect]
+        if rows:
+            def frac(idx, origin, size, pct):
+                v = [(e[idx] - c[origin]) / c[size] for e, c in rows]
+                return float(np.percentile(v, pct))
+
+            # Where the print sits, as fractions of the crop window. The
+            # medians place the frame - the typical page is what should end up
+            # evenly margined, and taking outer percentiles instead let one
+            # short page (a part title) drag the frame off every other page.
+            fit_top_frac = {
+                'left': frac(0, 0, 2, 50), 'top': frac(1, 1, 3, 50),
+                'right': frac(2, 0, 2, 50), 'bottom': frac(3, 1, 3, 50),
+            }
+            # How large the print gets, which is what caps the scale. Sizing
+            # off the very longest page gives up the headroom the rest of the
+            # book has - one figure page whose print already fills the frame
+            # would hold every other page at its current size - so the basis is
+            # a high percentile instead: the great majority of pages keep their
+            # margin, and the few longer ones spend theirs and can lose a little
+            # off the ends.
+            hs = [(e[3] - e[1]) / c[3] for e, c in rows]
+            ws = [(e[2] - e[0]) / c[2] for e, c in rows]
+            fit_top_frac['max_h'] = float(np.percentile(hs, _PRINT_FIT_PCT))
+            fit_top_frac['max_w'] = float(np.percentile(ws, _PRINT_FIT_PCT))
 
         odd_rects = [p.crop_rect for p in page_infos if p.is_odd and p.crop_rect]
         even_rects = [p.crop_rect for p in page_infos if not p.is_odd and p.crop_rect]
@@ -1456,7 +1576,7 @@ def _perform_pages_yohaku(
                 'mode': mode,
                 'crop_size': [crop_width, crop_height],
                 'output_size': [final_width, final_height],
-                'fit_top_frac': fit_top_frac.get(True, 0.0),
+                'print_frac': fit_top_frac or None,
                 'internal_size': [W, H],
                 'pages': pages_rec,
             })
