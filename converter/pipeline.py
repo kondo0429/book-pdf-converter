@@ -316,6 +316,23 @@ def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int,
     return resized[y0:y0 + target_h, x0:x0 + target_w]
 
 
+def _imread_any_path(path: str | Path) -> Optional[np.ndarray]:
+    """Read an image whose path may contain non-ASCII characters.
+
+    cv2.imread hands the path to the C runtime, which on Windows encodes it in
+    the active code page, so a path holding characters outside it (Japanese
+    file names, for one) never reaches the decoder and the read just fails.
+    Open the file in Python, which takes the path as text, and decode the bytes.
+    """
+    try:
+        data = np.fromfile(os.fspath(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
 def _write_geometry(path: str, data: dict) -> None:
     """Record the page geometry of this run for a later pass to reuse."""
     import json
@@ -721,7 +738,7 @@ def convert_images(
         src_sizes: List[Tuple[int, int]] = []  # (width, height) of each input
         src_dpis: List[Optional[Tuple[float, float]]] = []  # DPI per input
         for idx, (src_path, num) in enumerate(zip(src_paths, page_numbers)):
-            image = cv2.imread(str(src_path))
+            image = _imread_any_path(src_path)
             if image is None:
                 raise IOError(f"Cannot read image: {src_path}")
             h, w = image.shape[:2]
