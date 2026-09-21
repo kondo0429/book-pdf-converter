@@ -146,10 +146,11 @@ def build_pdf_from_files(
         author: PDF metadata author
     """
     import cv2
+    from .image_io import imread_any_path
 
     def load_images():
         for path in image_paths:
-            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            img = imread_any_path(path, cv2.IMREAD_UNCHANGED)
             if img is not None:
                 # Convert BGR to RGB if color
                 if len(img.shape) == 3:

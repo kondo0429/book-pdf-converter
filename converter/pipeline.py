@@ -24,6 +24,7 @@ import cv2
 from .pdf_reader import extract_pages, get_page_count
 from .pdf_writer import build_pdf
 from .enhancer import create_enhancer, BaseEnhancer
+from .image_io import imread_any_path, imwrite_any_path
 
 # Import from Cython module (C# faithful port)
 from .image_processing_cy import (
@@ -316,23 +317,6 @@ def _fit_to_source_size(image: np.ndarray, target_w: int, target_h: int,
     return resized[y0:y0 + target_h, x0:x0 + target_w]
 
 
-def _imread_any_path(path: str | Path) -> Optional[np.ndarray]:
-    """Read an image whose path may contain non-ASCII characters.
-
-    cv2.imread hands the path to the C runtime, which on Windows encodes it in
-    the active code page, so a path holding characters outside it (Japanese
-    file names, for one) never reaches the decoder and the read just fails.
-    Open the file in Python, which takes the path as text, and decode the bytes.
-    """
-    try:
-        data = np.fromfile(os.fspath(path), dtype=np.uint8)
-    except OSError:
-        return None
-    if data.size == 0:
-        return None
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
-
-
 def _write_geometry(path: str, data: dict) -> None:
     """Record the page geometry of this run for a later pass to reuse."""
     import json
@@ -474,7 +458,7 @@ def convert_pdf(
             src_sizes.append((image.shape[1], image.shape[0]))
             # Save as PNG
             out_path = os.path.join(pdf_extracted_dir, f"page_{page_num + 1:04d}.png")
-            cv2.imwrite(out_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            imwrite_any_path(out_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 
             report(idx + 1, pages_to_extract, f"Extracting page {page_num + 1}")
 
@@ -490,7 +474,7 @@ def convert_pdf(
         ])
 
         for idx, src_path in enumerate(extracted_files):
-            image = cv2.imread(src_path)
+            image = imread_any_path(src_path)
             h, w = image.shape[:2]
 
             if w >= 10 and h >= 10:
@@ -500,7 +484,7 @@ def convert_pdf(
                 cropped = image[margin_h:h - margin_h, margin_w:w - margin_w]
 
                 out_path = os.path.join(pdf_cropped_dir, os.path.basename(src_path))
-                cv2.imwrite(out_path, cropped)
+                imwrite_any_path(out_path, cropped)
 
             report(idx + 1, pages_to_extract, f"Cropping page {idx + 1}")
 
@@ -531,7 +515,7 @@ def convert_pdf(
             ])
 
             for idx, src_path in enumerate(cropped_files):
-                image = cv2.imread(src_path)
+                image = imread_any_path(src_path)
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
                 if options.tile_size > 0:
@@ -540,7 +524,7 @@ def convert_pdf(
                     enhanced = enhancer.enhance(image_rgb)
 
                 out_path = os.path.join(pdf_enhanced_dir, os.path.basename(src_path))
-                cv2.imwrite(out_path, cv2.cvtColor(enhanced, cv2.COLOR_RGB2BGR))
+                imwrite_any_path(out_path, cv2.cvtColor(enhanced, cv2.COLOR_RGB2BGR))
 
                 report(idx + 1, pages_to_extract, f"Enhancing page {idx + 1}")
 
@@ -575,7 +559,7 @@ def convert_pdf(
 
         def load_final_images():
             for idx, path in enumerate(output_files):
-                img = cv2.imread(path)
+                img = imread_any_path(path)
                 # Fit each processed page back to the pixel size of the page
                 # image extracted from the source PDF, so output pages have
                 # the same dimensions (and, embedded at the extraction DPI,
@@ -738,7 +722,7 @@ def convert_images(
         src_sizes: List[Tuple[int, int]] = []  # (width, height) of each input
         src_dpis: List[Optional[Tuple[float, float]]] = []  # DPI per input
         for idx, (src_path, num) in enumerate(zip(src_paths, page_numbers)):
-            image = _imread_any_path(src_path)
+            image = imread_any_path(src_path)
             if image is None:
                 raise IOError(f"Cannot read image: {src_path}")
             h, w = image.shape[:2]
@@ -751,7 +735,7 @@ def convert_images(
                 image = image[margin_h:h - margin_h, margin_w:w - margin_w]
 
             out_path = os.path.join(img_cropped_dir, f"page_{num:04d}.png")
-            cv2.imwrite(out_path, image)
+            imwrite_any_path(out_path, image)
             report(idx + 1, total_pages, f"Cropping {src_path.name}")
 
         # =====================================================================
@@ -779,7 +763,7 @@ def convert_images(
                 if f.endswith('.png')
             )
             for idx, src_path in enumerate(cropped_files):
-                image = cv2.imread(src_path)
+                image = imread_any_path(src_path)
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
                 if options.tile_size > 0:
@@ -788,7 +772,7 @@ def convert_images(
                     enhanced = enhancer.enhance(image_rgb)
 
                 out_path = os.path.join(img_enhanced_dir, os.path.basename(src_path))
-                cv2.imwrite(out_path, cv2.cvtColor(enhanced, cv2.COLOR_RGB2BGR))
+                imwrite_any_path(out_path, cv2.cvtColor(enhanced, cv2.COLOR_RGB2BGR))
                 report(idx + 1, total_pages, f"Enhancing page {idx + 1}")
 
         # =====================================================================
@@ -821,7 +805,7 @@ def convert_images(
             if not os.path.exists(adjusted_path):
                 report(idx + 1, total_pages, f"WARNING: no output for {name}")
                 continue
-            image = cv2.imread(adjusted_path)
+            image = imread_any_path(adjusted_path)
 
             # Fit the processed page back to the input file's pixel size, so
             # each output JPEG has exactly the same dimensions as its input.
@@ -975,7 +959,7 @@ def _perform_pages_yohaku(
     def process_phase1(page: PageInfo) -> Tuple[PageInfo, ColorStats]:
         """Process a single page for Phase 1 (resize, deskew, color stats)."""
         # Load image
-        img_bgr = cv2.imread(page.file_path)
+        img_bgr = imread_any_path(page.file_path)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         # Locate the sheet here, on the image as shot. The internal resize pads
@@ -1035,7 +1019,7 @@ def _perform_pages_yohaku(
 
         # Save deskewed image to tmp
         deskew_path = os.path.join(tmp_dir, f"deskew_{page.page_number:04d}.png")
-        cv2.imwrite(deskew_path, cv2.cvtColor(deskewed, cv2.COLOR_RGB2BGR))
+        imwrite_any_path(deskew_path, cv2.cvtColor(deskewed, cv2.COLOR_RGB2BGR))
         page.deskew_file_path = deskew_path
 
         # Calculate color statistics (Cython with nogil)
@@ -1101,7 +1085,7 @@ def _perform_pages_yohaku(
 
         # Load deskewed image
         _t = time.perf_counter()
-        img_bgr = cv2.imread(page.deskew_file_path)
+        img_bgr = imread_any_path(page.deskew_file_path)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         tm['load'] = time.perf_counter() - _t
 
@@ -1179,7 +1163,7 @@ def _perform_pages_yohaku(
         # Save color-adjusted image
         _t = time.perf_counter()
         color_adj_path = os.path.join(tmp_dir, f"coloradj_{page.page_number:04d}.png")
-        cv2.imwrite(color_adj_path, cv2.cvtColor(adjusted, cv2.COLOR_RGB2BGR))
+        imwrite_any_path(color_adj_path, cv2.cvtColor(adjusted, cv2.COLOR_RGB2BGR))
         page.color_adj_file_path = color_adj_path
         tm['save'] = time.perf_counter() - _t
 
@@ -1556,7 +1540,7 @@ def _perform_pages_yohaku(
         # Load all color-adjusted images for OCR
         ocr_images = []
         for idx, page in enumerate(page_infos):
-            img_bgr = cv2.imread(page.color_adj_file_path)
+            img_bgr = imread_any_path(page.color_adj_file_path)
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             ocr_images.append(img_rgb)
 
@@ -1644,7 +1628,7 @@ def _perform_pages_yohaku(
         if (options.bypass_first_page and is_front) or (options.bypass_last_page and is_back):
             # Bypass: use ESRGAN-enhanced image, skip deskew/color/crop
             # page.file_path points to the enhanced image from pdf_enhanced_dir
-            img_bgr = cv2.imread(page.file_path)
+            img_bgr = imread_any_path(page.file_path)
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
             # Scale to FINAL_TARGET_HEIGHT (3508) while keeping original aspect ratio
@@ -1660,7 +1644,7 @@ def _perform_pages_yohaku(
                     f'to {bypass_width}x{bypass_height} (no deskew/color/crop)')
         else:
             # Load color-adjusted image
-            img_bgr = cv2.imread(page.color_adj_file_path)
+            img_bgr = imread_any_path(page.color_adj_file_path)
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
             # Get crop region for this page. With page-area cropping every page
@@ -1715,7 +1699,7 @@ def _perform_pages_yohaku(
 
         # Save final image
         out_path = os.path.join(dst_dir, f"page_{page.page_number:04d}.png")
-        cv2.imwrite(out_path, cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR))
+        imwrite_any_path(out_path, cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR))
 
         return idx, v_prob
 
