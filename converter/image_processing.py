@@ -643,12 +643,16 @@ def remove_margin_background(
                 return
             num_k, lab_k, st_k, _ = cv2.connectedComponentsWithStats(comp_ink, 8)
             # vectorized per-part selection (see _glyph_ink_mask, incl. the
-            # fill-ratio gate against solid shadow lumps)
+            # solid-lump gate: solid AND chunky, so thin bar glyphs survive)
             bbox_k = np.maximum(st_k[:, cv2.CC_STAT_WIDTH].astype(np.int64)
                                 * st_k[:, cv2.CC_STAT_HEIGHT], 1)
+            narrow_k = np.minimum(st_k[:, cv2.CC_STAT_WIDTH],
+                                  st_k[:, cv2.CC_STAT_HEIGHT])
+            lump_k = ((st_k[:, cv2.CC_STAT_AREA] / bbox_k > 0.65)
+                      & (narrow_k > max(1, int(h * 0.012))))
             ok = ((st_k[:, cv2.CC_STAT_HEIGHT] <= glyph_max_h)
                   & (st_k[:, cv2.CC_STAT_AREA] >= 50)
-                  & (st_k[:, cv2.CC_STAT_AREA] / bbox_k <= 0.65))
+                  & ~lump_k)
             ok[0] = False
             if ok.any():
                 flat_k = lab_k.ravel()
@@ -843,6 +847,7 @@ def _glyph_ink_mask(
     glyph_max_frac: float = 0.05,
     min_area: int = 50,
     border_overlap_max: float = 0.3,
+    lump_dim_frac: float = 0.012,
 ) -> np.ndarray:
     """Mask of glyph-sized real-ink parts that are NOT on border-connected junk.
 
@@ -851,6 +856,10 @@ def _glyph_ink_mask(
     border-connected junk (bit 2 of junk_mask) - ink there is either print
     from the neighboring page or dark specks inside a page-stack shadow band,
     neither of which is this page's text.
+
+    lump_dim_frac: a solid component only counts as a shadow lump when its
+    narrow side exceeds this fraction of the image height (no glyph stroke is
+    that thick), so solid *thin* glyphs stay protected.
     """
     h, w = gray.shape[:2]
     ink = (gray < ink_keep).astype(np.uint8)
@@ -870,15 +879,23 @@ def _glyph_ink_mask(
     num, lab, st, _ = cv2.connectedComponentsWithStats(ink, 8)
     # Vectorized per-component selection (a Python loop with a full-size
     # `lab == i` per glyph is O(components * pixels) and dominated Phase 4.3)
-    # Fill-ratio gate: glyphs are strokes with paper inside (fill well below
-    # 1), while shadow blobs / edge fragments are solid lumps - dark AND
-    # glyph-sized, but not text.
+    # Solid-lump gate: shadow blobs / edge fragments are dark, glyph-sized and
+    # solid, unlike glyphs that are strokes with paper inside. Fill ratio alone
+    # cannot say that: a bar glyph (the vertical-writing chochoon ー, 一, I, ｜)
+    # or a dense radical (the 日 of 昧) is solid too - it is merely THIN, one
+    # stroke wide. A lump is solid *and* chunky, so a high-fill component only
+    # counts as one when its narrow side is thicker than any glyph stroke can
+    # be at this resolution. Without the thickness test every bar glyph in an
+    # outer column (a vertical-writing title runs down the page edge) lost its
+    # protection and was painted out as a smudge.
     bbox_area = np.maximum(st[:, cv2.CC_STAT_WIDTH].astype(np.int64)
                            * st[:, cv2.CC_STAT_HEIGHT], 1)
     fill = st[:, cv2.CC_STAT_AREA] / bbox_area
+    narrow_side = np.minimum(st[:, cv2.CC_STAT_WIDTH], st[:, cv2.CC_STAT_HEIGHT])
+    solid_lump = (fill > 0.65) & (narrow_side > max(1, int(h * lump_dim_frac)))
     ok = ((st[:, cv2.CC_STAT_HEIGHT] <= glyph_max_h)
           & (st[:, cv2.CC_STAT_AREA] >= min_area)
-          & (fill <= 0.65))
+          & ~solid_lump)
     ok[0] = False  # background label
     if bj is not None and ok.any():
         flat = lab.ravel()
