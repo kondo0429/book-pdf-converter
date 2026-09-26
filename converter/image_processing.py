@@ -683,20 +683,34 @@ def remove_margin_background(
         keep |= clear[labels] & ~fat
         for i in swallowed:
             rescue_glyphs(labels == i)
-        # Strip components may hold a fore-edge running head - but only on a
-        # CLEAN side. A side whose strip zone carries substantial
-        # border-connected junk is the gutter/spine side, where glyph-shaped
-        # ink is print from the neighboring page, never this page's text.
+        # Strip components may hold a fore-edge running head or a body column
+        # set close to the page edge - but only on a CLEAN side. A side whose
+        # border-connected junk reaches deep into the strip is the
+        # gutter/spine side, where glyph-shaped ink is print from the
+        # neighboring page, never this page's text. Depth, not the strip's
+        # junk fraction, is what tells the sides apart: a sheet that nearly
+        # fills the frame leaves only a thin sliver of stand / page stack past
+        # its edge, which alone reached the old fraction cutoff and erased the
+        # page's outermost text column, while a gutter's junk spans a band
+        # several times wider.
+        # A rescued component must also stay inward of that sliver and off
+        # the frame border: marks reaching into either are the page stack /
+        # stand past the sheet's edge (its corner, its edge lines), not print.
         strip_px = max(int(strip), 1)
         bj = (junk_mask & 2) > 0
-        side_bj = {
-            'L': float(bj[:, :strip_px].mean()),
-            'R': float(bj[:, w - strip_px:].mean()),
-        }
+        cols_l = np.where(bj[:, :strip_px].mean(axis=0) > 0.1)[0]
+        cols_r = np.where(bj[:, w - strip_px:].mean(axis=0) > 0.1)[0] \
+            + (w - strip_px)
+        side_depth = {'L': len(cols_l), 'R': len(cols_r)}
+        inner_l = int(cols_l[-1]) + 1 if len(cols_l) else 1
+        inner_r = int(cols_r[0]) if len(cols_r) else w - 1
+        max_depth = int(strip_px * 0.15)
         for i in strip_ids:
-            side = 'L' if stats[i, cv2.CC_STAT_LEFT] + \
-                stats[i, cv2.CC_STAT_WIDTH] <= strip else 'R'
-            if side_bj[side] > 0.02:
+            x, bw = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_WIDTH]
+            side = 'L' if x + bw <= strip else 'R'
+            if side_depth[side] > max_depth:
+                continue
+            if x < inner_l or x + bw > inner_r:
                 continue
             rescue_glyphs(labels == i)
     else:
