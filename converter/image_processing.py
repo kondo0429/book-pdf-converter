@@ -280,6 +280,7 @@ def remove_show_through(
     mask_threshold: int = 200,
     edge_pad: int = 5,
     soft_white_point: int = 235,
+    keep_color: bool = False,
 ) -> np.ndarray:
     """
     Remove show-through (裏映り) text and non-uniform background color.
@@ -287,7 +288,8 @@ def remove_show_through(
     Unlike the global-linear ApplyGlobalColorAdjustment, this estimates the paper
     background *locally* and flattens it, so uneven illumination and faint
     reverse-side text are eliminated while foreground ink is preserved. The output
-    is grayscale replicated to 3 channels (RGB), suitable for text-heavy pages.
+    is grayscale replicated to 3 channels (RGB), suitable for text-heavy pages,
+    or keeps the ink colors with keep_color.
 
     Steps:
       1. Estimate paper background via morphological closing (removes dark text,
@@ -318,24 +320,33 @@ def remove_show_through(
                   glyph fringes survive around every stroke.
         soft_white_point: White point of the gentle foreground stretch (higher
                           than white_point = smoother edges inside the mask).
+        keep_color: Keep ink colors (2-/3-color printed books: black + red,
+                    black + red + blue, ...). Every RGB channel is flat-fielded
+                    and stretched on its own, so the paper still becomes
+                    uniform white while colored ink keeps its hue. Content is
+                    decided on the darkest channel, since colored ink can be
+                    light in luminance yet is dark in at least one channel.
 
     Returns:
-        Show-through-removed image (RGB, 3-channel grayscale)
+        Show-through-removed image (RGB; 3-channel grayscale unless keep_color)
     """
     if image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     else:
         gray = image
+        keep_color = False
+    src = image if keep_color else gray
 
     # 1) Estimate paper background (dark text closed out, illumination retained)
     if bg_ksize % 2 == 0:
         bg_ksize += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bg_ksize, bg_ksize))
-    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    bg = cv2.morphologyEx(src, cv2.MORPH_CLOSE, kernel)
     bg = cv2.GaussianBlur(bg, (0, 0), bg_ksize / 6.0)
 
     # 2) Flat-field division: paper -> ~255 uniformly across the page
-    norm = gray.astype(np.float32) / (bg.astype(np.float32) + 1e-3) * 255.0
+    norm_src = src.astype(np.float32) / (bg.astype(np.float32) + 1e-3) * 255.0
+    norm = norm_src.min(axis=2) if keep_color else norm_src
 
     # 3) Hard contrast stretch: ink -> 0, paper + show-through -> 255.
     #    Used only to decide what is important content (it clips glyph
@@ -358,16 +369,18 @@ def remove_show_through(
     # Gentle foreground tones: same black point, but a much higher white
     # point, so glyph edge gradients survive instead of being clipped away
     soft_denom = max(soft_white_point - black_point, 1)
-    soft = np.clip((norm - black_point) / soft_denom, 0.0, 1.0)
+    soft = np.clip((norm_src - black_point) / soft_denom, 0.0, 1.0)
     if gamma != 1.0:
         soft = soft ** gamma
     soft8 = (soft * 255.0).astype(np.uint8)
 
     # Composite: white background, smooth tones inside the (padded) mask
-    out = np.full_like(hard8, 255)
+    out = np.full_like(soft8, 255)
     m = mask > 0
     out[m] = soft8[m]
 
+    if keep_color:
+        return out
     # Return as 3-channel RGB so downstream (bbox, crop, PDF) stays uniform
     return cv2.cvtColor(out, cv2.COLOR_GRAY2RGB)
 

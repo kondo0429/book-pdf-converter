@@ -166,6 +166,11 @@ class ConversionOptions:
     bleed_bg_ksize: int = 151
     bleed_black_point: int = 115
     bleed_white_point: int = 205
+    # Keep ink colors in show-through removal instead of going grayscale, for
+    # 2-/3-color printed books (black + red, black + red + blue, ...): on all
+    # pages with bleed_keep_color, or only on the listed 1-indexed pages.
+    bleed_keep_color: bool = False
+    bleed_keep_color_pages: Optional[Set[int]] = None
 
     # Whiten the four outer margin bands that contain no text (see
     # remove_margin_background). A band is cleared only if it touches a page
@@ -1107,16 +1112,19 @@ def _perform_pages_yohaku(
         apply_bleed = not options.no_bleed_removal and page.page_number not in bleed_exclude
         _t = time.perf_counter()
         if apply_bleed:
+            keep_color = (options.bleed_keep_color
+                          or page.page_number in (options.bleed_keep_color_pages or set()))
             adjusted = remove_show_through(
                 img_rgb,
                 bg_ksize=options.bleed_bg_ksize,
                 black_point=options.bleed_black_point,
                 white_point=options.bleed_white_point,
+                keep_color=keep_color,
             )
             adjusted = np.ascontiguousarray(adjusted)
             color_dbg = (f'show-through removal applied (ksize={options.bleed_bg_ksize}, '
                          f'black={options.bleed_black_point}, white={options.bleed_white_point}, '
-                         f'grayscale output)')
+                         f'{"ink colors kept" if keep_color else "grayscale output"})')
         else:
             # Apply color adjustment (Cython with nogil - modifies in-place)
             color_param = odd_color_param if page.is_odd else even_color_param
