@@ -60,6 +60,7 @@ from .image_processing import (
     detect_text_bounding_box,
     detect_page_area,
     page_area_anchor,
+    detect_color_regions,
 )
 
 from .ocr import (
@@ -166,6 +167,11 @@ class ConversionOptions:
     bleed_bg_ksize: int = 151
     bleed_black_point: int = 115
     bleed_white_point: int = 205
+    # Keep ink colors in show-through removal instead of going grayscale, for
+    # 2-/3-color printed books (black + red, black + red + blue, ...): on all
+    # pages with bleed_keep_color, or only on the listed 1-indexed pages.
+    bleed_keep_color: bool = False
+    bleed_keep_color_pages: Optional[Set[int]] = None
 
     # Whiten the four outer margin bands that contain no text (see
     # remove_margin_background). A band is cleared only if it touches a page
@@ -956,6 +962,14 @@ def _perform_pages_yohaku(
             return None
         return (x0, y0, x1 - x0, y1 - y0)
 
+    def keeps_color(page: PageInfo) -> bool:
+        """Whether show-through removal keeps ink colors on this page."""
+        if options.no_bleed_removal or page.page_number in (
+                options.bleed_removal_exclude_pages or set()):
+            return False
+        return (options.bleed_keep_color
+                or page.page_number in (options.bleed_keep_color_pages or set()))
+
     def process_phase1(page: PageInfo) -> Tuple[PageInfo, ColorStats]:
         """Process a single page for Phase 1 (resize, deskew, color stats)."""
         # Load image
@@ -966,7 +980,7 @@ def _perform_pages_yohaku(
         # to a different aspect with paper colour, and that padding is as bright
         # as the sheet and touches it, so the bright region spans the whole
         # internal frame and the stand can no longer be told from the page.
-        src_area = detect_page_area(img_rgb)
+        src_area = detect_page_area(img_rgb, use_max_channel=keeps_color(page))
 
         # Resize to internal high-res with natural paper padding (Cython with nogil)
         resized = ResizeAndMakePaddingWithNaturalPaperColor(
@@ -1106,17 +1120,31 @@ def _perform_pages_yohaku(
         bleed_exclude = options.bleed_removal_exclude_pages or set()
         apply_bleed = not options.no_bleed_removal and page.page_number not in bleed_exclude
         _t = time.perf_counter()
+        keep_color = apply_bleed and keeps_color(page)
+        color_mask = None
+        if keep_color:
+            # Colored print (spot-color bands, tints) must survive both the
+            # flat-field and the margin whitening. Beyond the detected sheet it
+            # is not this page's print (the page stack's colored edges).
+            color_mask = detect_color_regions(img_rgb)
+            if page.page_area is not None:
+                ax, ay, aw, ah = page.page_area
+                inside = np.zeros(color_mask.shape, dtype=bool)
+                inside[ay:ay + ah, ax:ax + aw] = True
+                color_mask &= inside
         if apply_bleed:
             adjusted = remove_show_through(
                 img_rgb,
                 bg_ksize=options.bleed_bg_ksize,
                 black_point=options.bleed_black_point,
                 white_point=options.bleed_white_point,
+                keep_color=keep_color,
+                color_mask=color_mask,
             )
             adjusted = np.ascontiguousarray(adjusted)
             color_dbg = (f'show-through removal applied (ksize={options.bleed_bg_ksize}, '
                          f'black={options.bleed_black_point}, white={options.bleed_white_point}, '
-                         f'grayscale output)')
+                         f'{"ink colors kept" if keep_color else "grayscale output"})')
         else:
             # Apply color adjustment (Cython with nogil - modifies in-place)
             color_param = odd_color_param if page.is_odd else even_color_param
@@ -1125,6 +1153,8 @@ def _perform_pages_yohaku(
             why = '--no-bleed-removal' if options.no_bleed_removal else 'excluded page'
             color_dbg = f'show-through SKIPPED ({why}) -> global color adjustment (color kept)'
         tm['adjust'] = time.perf_counter() - _t
+        if color_mask is not None:
+            color_dbg += f' | colored area kept={int(color_mask.sum()):,} px'
 
         # Whiten the text-free outer margin bands (before bbox so the crop
         # isn't pulled toward edge junk / spine shadows). The returned text
@@ -1137,6 +1167,7 @@ def _perform_pages_yohaku(
                 adjusted,
                 margin_pad=options.margin_pad,
                 junk_mask=edge_junk,
+                protect_mask=color_mask,
                 debug_out=mw_dbg if options.debug else None,
             )
             adjusted = np.ascontiguousarray(whitened)

@@ -105,6 +105,12 @@ Examples:
                         help='Show-through removal: values <= this become ink/black (default: 115)')
     parser.add_argument('--bleed-white-point', type=int, default=205,
                         help='Show-through removal: values >= this become paper/white; lower removes more (default: 205)')
+    parser.add_argument('--bleed-keep-color', action='store_true',
+                        help='Show-through removal: keep ink colors instead of grayscale output '
+                             '(for 2-/3-color printed books, e.g. black + red)')
+    parser.add_argument('--bleed-keep-color-pages', type=str, default=None,
+                        help='Page numbers (1-indexed) to keep ink colors in show-through removal, '
+                             'e.g. "1,4,7-9" (other pages stay grayscale)')
 
     # Margin whitening - clear the text-free outer margin bands (on by default).
     # A band is cleared only if it touches a page edge and runs to the opposite
@@ -193,6 +199,15 @@ Examples:
             print(f"Error: invalid --bleed-removal-exclude-pages: {e}", file=sys.stderr)
             sys.exit(1)
 
+    # Parse keep-color pages
+    bleed_keep_color_pages = None
+    if args.bleed_keep_color_pages:
+        try:
+            bleed_keep_color_pages = parse_page_ranges(args.bleed_keep_color_pages)
+        except ValueError as e:
+            print(f"Error: invalid --bleed-keep-color-pages: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Build options
     options_kwargs = dict(
         margin_percent=args.margin_percent,
@@ -218,6 +233,8 @@ Examples:
         bleed_bg_ksize=args.bleed_bg_ksize,
         bleed_black_point=args.bleed_black_point,
         bleed_white_point=args.bleed_white_point,
+        bleed_keep_color=args.bleed_keep_color,
+        bleed_keep_color_pages=bleed_keep_color_pages,
         disable_margin_whitening=args.no_margin_whitening,
         margin_pad=args.margin_pad,
         debug=args.debug is not None,

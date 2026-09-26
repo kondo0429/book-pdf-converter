@@ -280,6 +280,8 @@ def remove_show_through(
     mask_threshold: int = 200,
     edge_pad: int = 5,
     soft_white_point: int = 235,
+    keep_color: bool = False,
+    color_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Remove show-through (裏映り) text and non-uniform background color.
@@ -287,7 +289,8 @@ def remove_show_through(
     Unlike the global-linear ApplyGlobalColorAdjustment, this estimates the paper
     background *locally* and flattens it, so uneven illumination and faint
     reverse-side text are eliminated while foreground ink is preserved. The output
-    is grayscale replicated to 3 channels (RGB), suitable for text-heavy pages.
+    is grayscale replicated to 3 channels (RGB), suitable for text-heavy pages,
+    or keeps the ink colors with keep_color.
 
     Steps:
       1. Estimate paper background via morphological closing (removes dark text,
@@ -318,24 +321,49 @@ def remove_show_through(
                   glyph fringes survive around every stroke.
         soft_white_point: White point of the gentle foreground stretch (higher
                           than white_point = smoother edges inside the mask).
+        keep_color: Keep ink colors (2-/3-color printed books: black + red,
+                    black + red + blue, ...). Every RGB channel is flat-fielded
+                    and stretched on its own, so the paper still becomes
+                    uniform white while colored ink keeps its hue. Content is
+                    decided on the darkest channel, since colored ink can be
+                    light in luminance yet is dark in at least one channel.
+        color_mask: Colored areas for keep_color (see detect_color_regions;
+                    computed when None). A flat color area wider than bg_ksize
+                    (a band bleeding off the page edge, a tinted title bar)
+                    would otherwise be taken for paper and flattened to white,
+                    so it is left out of the background estimate, normalized
+                    by the paper color instead, and always kept.
 
     Returns:
-        Show-through-removed image (RGB, 3-channel grayscale)
+        Show-through-removed image (RGB; 3-channel grayscale unless keep_color)
     """
     if image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     else:
         gray = image
-
-    # 1) Estimate paper background (dark text closed out, illumination retained)
+        keep_color = False
     if bg_ksize % 2 == 0:
         bg_ksize += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bg_ksize, bg_ksize))
-    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-    bg = cv2.GaussianBlur(bg, (0, 0), bg_ksize / 6.0)
 
-    # 2) Flat-field division: paper -> ~255 uniformly across the page
-    norm = gray.astype(np.float32) / (bg.astype(np.float32) + 1e-3) * 255.0
+    if keep_color:
+        if color_mask is None:
+            color_mask = detect_color_regions(image)
+        paper = _paper_color(image)
+        # Colored areas are filled with the paper color before estimating the
+        # background, so they neither read as background themselves nor darken
+        # the estimate on the paper around them (which leaves color fringes).
+        fill = image.copy()
+        fill[color_mask] = np.clip(paper, 0, 255).astype(np.uint8)
+        bg = _estimate_background(fill, bg_ksize, downscale=4)
+        bg[color_mask] = _illumination_under(bg, color_mask, paper)[color_mask]
+        norm_src = image.astype(np.float32) / (bg + 1e-3) * 255.0
+        norm = norm_src.min(axis=2)
+    else:
+        # 1) Estimate paper background (dark text closed out, illumination retained)
+        bg = _estimate_background(gray, bg_ksize)
+        # 2) Flat-field division: paper -> ~255 uniformly across the page
+        norm_src = gray.astype(np.float32) / (bg + 1e-3) * 255.0
+        norm = norm_src
 
     # 3) Hard contrast stretch: ink -> 0, paper + show-through -> 255.
     #    Used only to decide what is important content (it clips glyph
@@ -349,6 +377,8 @@ def remove_show_through(
     # 4) Importance mask (content the hard stretch keeps visibly dark),
     #    dilated a little so the anti-aliased fringes of glyphs are covered
     mask = (hard8 < mask_threshold).astype(np.uint8)
+    if keep_color:
+        mask[color_mask] = 1
     if edge_pad > 0:
         mask = cv2.dilate(
             mask, cv2.getStructuringElement(
@@ -358,18 +388,146 @@ def remove_show_through(
     # Gentle foreground tones: same black point, but a much higher white
     # point, so glyph edge gradients survive instead of being clipped away
     soft_denom = max(soft_white_point - black_point, 1)
-    soft = np.clip((norm - black_point) / soft_denom, 0.0, 1.0)
+    soft = np.clip((norm_src - black_point) / soft_denom, 0.0, 1.0)
     if gamma != 1.0:
         soft = soft ** gamma
     soft8 = (soft * 255.0).astype(np.uint8)
 
     # Composite: white background, smooth tones inside the (padded) mask
-    out = np.full_like(hard8, 255)
+    out = np.full_like(soft8, 255)
     m = mask > 0
     out[m] = soft8[m]
 
+    if keep_color:
+        return out
     # Return as 3-channel RGB so downstream (bbox, crop, PDF) stays uniform
     return cv2.cvtColor(out, cv2.COLOR_GRAY2RGB)
+
+
+def _estimate_background(src: np.ndarray, ksize: int, downscale: int = 1) -> np.ndarray:
+    """Paper background: closing (dark content removed) + Gaussian blur.
+
+    The result is smooth, so with downscale > 1 it is estimated on a reduced
+    image and scaled back up, which is far cheaper for 3-channel input.
+    """
+    h, w = src.shape[:2]
+    if downscale > 1:
+        work = cv2.resize(src, (max(1, w // downscale), max(1, h // downscale)),
+                          interpolation=cv2.INTER_AREA)
+        ksize = max(3, (ksize // downscale) | 1)
+    else:
+        work = src
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    bg = cv2.morphologyEx(work, cv2.MORPH_CLOSE, kernel)
+    bg = cv2.GaussianBlur(bg, (0, 0), ksize / 6.0)
+    if downscale > 1:
+        bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+    return bg.astype(np.float32)
+
+
+def _illumination_under(bg: np.ndarray, mask: np.ndarray, paper: np.ndarray,
+                        scale: int = 16) -> np.ndarray:
+    """Paper background under masked (colored) areas, carried in from the paper
+    around them, so a colored band keeps an even tone where the lighting falls
+    off toward the page edge. The paper color is used when too little paper is
+    left to go by."""
+    h, w = mask.shape
+    size = (max(1, w // scale), max(1, h // scale))
+    small = cv2.resize(bg, size, interpolation=cv2.INTER_AREA)
+    hole = cv2.resize(mask.astype(np.float32), size, interpolation=cv2.INTER_AREA) > 0
+    # bg right next to a colored area is pulled toward the paper-color fill
+    hole = cv2.dilate(hole.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    # the stand and off-page shadows are not paper
+    hole |= small.mean(axis=2) < 0.6 * float(paper.mean())
+    if hole.mean() > 0.9:
+        return np.broadcast_to(paper, bg.shape)
+    filled = cv2.inpaint(np.clip(small, 0, 255).astype(np.uint8),
+                         hole.astype(np.uint8), 3, cv2.INPAINT_TELEA)
+    filled = cv2.GaussianBlur(filled.astype(np.float32), (0, 0), 2.0)
+    return cv2.resize(filled, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _paper_color(image: np.ndarray) -> np.ndarray:
+    """Mean RGB of the brightest 5% of pixels (the paper), as float32."""
+    s = image[::4, ::4].reshape(-1, 3).astype(np.float32)
+    lum = s @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    sel = s[lum >= np.percentile(lum, 95)]
+    if not len(sel):
+        return np.full(3, 255.0, dtype=np.float32)
+    return sel.mean(axis=0)
+
+
+def detect_color_regions(
+    image: np.ndarray,
+    chroma_threshold: int = 25,
+    open_px: int = 5,
+    close_px: int = 15,
+    min_area: int = 2000,
+    tint_scale: int = 8,
+    tint_low_ratio: float = 0.7,
+    tint_max_hole: float = 0.005,
+) -> np.ndarray:
+    """Mask of colored (chromatic) print: spot-color bands, tints, color text.
+
+    Chroma (max - min channel) is measured after white-balancing to the paper
+    color, so yellowed paper, gutter shadows and the dark stand - all near
+    neutral relative to the paper - stay out. Show-through of colored ink is
+    faint and stays below the threshold. The opening drops thin color fringes
+    (lens chromatic aberration along high-contrast edges) and speckle; the
+    closing takes in ink printed inside a colored area.
+
+    A pale tint (a light spot-color band) sits right at the threshold pixel by
+    pixel, so noise breaks it into speckle whose holes would be flattened to
+    white. On a smoothed 1/tint_scale chroma map the tint stays steadily above
+    the threshold and the paper below it, so tint areas are also taken whole:
+    connected areas above tint_low_ratio * chroma_threshold that reach the
+    full threshold somewhere.
+    """
+    paper = _paper_color(image)
+    wb = cv2.transform(image, np.diag(255.0 / np.maximum(paper, 1.0)))
+    fine = cv2.blur(wb, (5, 5))
+    chroma = cv2.subtract(fine.max(axis=2), fine.min(axis=2))
+    mask = (chroma >= chroma_threshold).astype(np.uint8)
+
+    if tint_scale > 1:
+        h, w = mask.shape
+        small = cv2.resize(wb, (max(1, w // tint_scale), max(1, h // tint_scale)),
+                           interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), 1.5)
+        s_chroma = cv2.subtract(small.max(axis=2), small.min(axis=2))
+        low = (s_chroma >= chroma_threshold * tint_low_ratio).astype(np.uint8)
+        num, lab, st, _ = cv2.connectedComponentsWithStats(low, 8)
+        seeded = np.zeros(num, dtype=bool)
+        seeded[lab[s_chroma >= chroma_threshold]] = True
+        seeded &= st[:, cv2.CC_STAT_AREA] * tint_scale * tint_scale >= min_area
+        seeded[0] = False
+        # The smoothed map ends a little inside the tint's border; grow it back,
+        # but only over pixels that are still somewhat chromatic, so the
+        # neutral dark stand / page-edge shadow next to the tint stays out.
+        tint = cv2.resize(seeded[lab].astype(np.uint8), (w, h),
+                          interpolation=cv2.INTER_LINEAR)
+        tint = cv2.dilate(tint, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * tint_scale + 1, 2 * tint_scale + 1)))
+        tint &= (chroma >= chroma_threshold * 0.5).astype(np.uint8)
+        # That also cuts out white print inside the tint (a white chapter
+        # number in a colored box); take enclosed holes back in, short of the
+        # page's own paper area (show-through there must still be removed).
+        num, lab, st, _ = cv2.connectedComponentsWithStats(1 - tint, 4)
+        enclosed = st[:, cv2.CC_STAT_AREA] <= h * w * tint_max_hole
+        border_labels = np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])
+        enclosed[border_labels] = False
+        enclosed[0] = False
+        tint |= enclosed[lab].astype(np.uint8)
+        mask |= tint
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (open_px, open_px)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (close_px, close_px)))
+    num, lab, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+    keep = st[:, cv2.CC_STAT_AREA] >= min_area
+    keep[0] = False
+    return keep[lab]
 
 
 # =============================================================================
@@ -525,6 +683,7 @@ def remove_margin_background(
     edge_exclude_frac: float = 0.10,
     paper: int = 255,
     junk_mask: Optional[np.ndarray] = None,
+    protect_mask: Optional[np.ndarray] = None,
     debug_out: Optional[dict] = None,
 ) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
     """
@@ -559,6 +718,10 @@ def remove_margin_background(
         junk_mask: Optional mask from detect_page_edge_junk() (computed on the
                    PRE-adjustment image, same geometry): marked areas never
                    count as text, so the margin bands extend over them.
+        protect_mask: Optional bool mask of print that must never be painted
+                      (colored areas, which may bleed off the page edge). It
+                      is restored after every pass but does not count toward
+                      the returned extent.
 
     Returns:
         Tuple of:
@@ -839,6 +1002,12 @@ def remove_margin_background(
     scrub[:, w - zone:] = True
     scrub &= faint & ~preserve
     out[scrub] = paper
+
+    # The extent stays the text's: it places and scales the page in the output
+    # frame, and a band bleeding off the edges would widen it to the whole
+    # sheet, so the trim would cut into the running head and page number.
+    if protect_mask is not None:
+        out[protect_mask] = image[protect_mask]
 
     if debug_out is not None:
         _t5 = time.perf_counter()
@@ -1493,7 +1662,8 @@ def apply_global_color_adjustment_fast(image: np.ndarray, param: GlobalColorPara
 # (C) Bounding Box Detection
 # =============================================================================
 def detect_page_area(image: np.ndarray, cov_frac: float = 0.5,
-                     ds: int = 4) -> Optional[Tuple[int, int, int, int]]:
+                     ds: int = 4, use_max_channel: bool = False
+                     ) -> Optional[Tuple[int, int, int, int]]:
     """Detect the paper (page) region of a camera-scan page.
 
     Book-scanner shots put the sheet on a dark stand, so the paper is the one
@@ -1507,9 +1677,18 @@ def detect_page_area(image: np.ndarray, cov_frac: float = 0.5,
     and the widest contiguous run of those is taken - a partial-height sliver
     and the gutter dip both fall away.
 
+    use_max_channel measures brightness as the max RGB channel instead of
+    luminance, so saturated color printed up to the sheet edge (a red band has
+    luminance close to the stand's) still counts as paper.
+
     Returns (x, y, w, h) in image coordinates, or None when no page is found.
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    if image.ndim != 3:
+        gray = image
+    elif use_max_channel:
+        gray = image.max(axis=2)
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape[:2]
     small = cv2.resize(gray, (max(1, w // ds), max(1, h // ds)),
                        interpolation=cv2.INTER_AREA)
