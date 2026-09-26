@@ -355,7 +355,7 @@ def remove_show_through(
         fill = image.copy()
         fill[color_mask] = np.clip(paper, 0, 255).astype(np.uint8)
         bg = _estimate_background(fill, bg_ksize, downscale=4)
-        bg[color_mask] = paper
+        bg[color_mask] = _illumination_under(bg, color_mask, paper)[color_mask]
         norm_src = image.astype(np.float32) / (bg + 1e-3) * 255.0
         norm = norm_src.min(axis=2)
     else:
@@ -425,6 +425,28 @@ def _estimate_background(src: np.ndarray, ksize: int, downscale: int = 1) -> np.
     return bg.astype(np.float32)
 
 
+def _illumination_under(bg: np.ndarray, mask: np.ndarray, paper: np.ndarray,
+                        scale: int = 16) -> np.ndarray:
+    """Paper background under masked (colored) areas, carried in from the paper
+    around them, so a colored band keeps an even tone where the lighting falls
+    off toward the page edge. The paper color is used when too little paper is
+    left to go by."""
+    h, w = mask.shape
+    size = (max(1, w // scale), max(1, h // scale))
+    small = cv2.resize(bg, size, interpolation=cv2.INTER_AREA)
+    hole = cv2.resize(mask.astype(np.float32), size, interpolation=cv2.INTER_AREA) > 0
+    # bg right next to a colored area is pulled toward the paper-color fill
+    hole = cv2.dilate(hole.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    # the stand and off-page shadows are not paper
+    hole |= small.mean(axis=2) < 0.6 * float(paper.mean())
+    if hole.mean() > 0.9:
+        return np.broadcast_to(paper, bg.shape)
+    filled = cv2.inpaint(np.clip(small, 0, 255).astype(np.uint8),
+                         hole.astype(np.uint8), 3, cv2.INPAINT_TELEA)
+    filled = cv2.GaussianBlur(filled.astype(np.float32), (0, 0), 2.0)
+    return cv2.resize(filled, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def _paper_color(image: np.ndarray) -> np.ndarray:
     """Mean RGB of the brightest 5% of pixels (the paper), as float32."""
     s = image[::4, ::4].reshape(-1, 3).astype(np.float32)
@@ -441,6 +463,9 @@ def detect_color_regions(
     open_px: int = 5,
     close_px: int = 15,
     min_area: int = 2000,
+    tint_scale: int = 8,
+    tint_low_ratio: float = 0.7,
+    tint_max_hole: float = 0.005,
 ) -> np.ndarray:
     """Mask of colored (chromatic) print: spot-color bands, tints, color text.
 
@@ -450,12 +475,51 @@ def detect_color_regions(
     faint and stays below the threshold. The opening drops thin color fringes
     (lens chromatic aberration along high-contrast edges) and speckle; the
     closing takes in ink printed inside a colored area.
+
+    A pale tint (a light spot-color band) sits right at the threshold pixel by
+    pixel, so noise breaks it into speckle whose holes would be flattened to
+    white. On a smoothed 1/tint_scale chroma map the tint stays steadily above
+    the threshold and the paper below it, so tint areas are also taken whole:
+    connected areas above tint_low_ratio * chroma_threshold that reach the
+    full threshold somewhere.
     """
     paper = _paper_color(image)
     wb = cv2.transform(image, np.diag(255.0 / np.maximum(paper, 1.0)))
-    wb = cv2.blur(wb, (5, 5))
-    chroma = cv2.subtract(wb.max(axis=2), wb.min(axis=2))
+    fine = cv2.blur(wb, (5, 5))
+    chroma = cv2.subtract(fine.max(axis=2), fine.min(axis=2))
     mask = (chroma >= chroma_threshold).astype(np.uint8)
+
+    if tint_scale > 1:
+        h, w = mask.shape
+        small = cv2.resize(wb, (max(1, w // tint_scale), max(1, h // tint_scale)),
+                           interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), 1.5)
+        s_chroma = cv2.subtract(small.max(axis=2), small.min(axis=2))
+        low = (s_chroma >= chroma_threshold * tint_low_ratio).astype(np.uint8)
+        num, lab, st, _ = cv2.connectedComponentsWithStats(low, 8)
+        seeded = np.zeros(num, dtype=bool)
+        seeded[lab[s_chroma >= chroma_threshold]] = True
+        seeded &= st[:, cv2.CC_STAT_AREA] * tint_scale * tint_scale >= min_area
+        seeded[0] = False
+        # The smoothed map ends a little inside the tint's border; grow it back,
+        # but only over pixels that are still somewhat chromatic, so the
+        # neutral dark stand / page-edge shadow next to the tint stays out.
+        tint = cv2.resize(seeded[lab].astype(np.uint8), (w, h),
+                          interpolation=cv2.INTER_LINEAR)
+        tint = cv2.dilate(tint, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * tint_scale + 1, 2 * tint_scale + 1)))
+        tint &= (chroma >= chroma_threshold * 0.5).astype(np.uint8)
+        # That also cuts out white print inside the tint (a white chapter
+        # number in a colored box); take enclosed holes back in, short of the
+        # page's own paper area (show-through there must still be removed).
+        num, lab, st, _ = cv2.connectedComponentsWithStats(1 - tint, 4)
+        enclosed = st[:, cv2.CC_STAT_AREA] <= h * w * tint_max_hole
+        border_labels = np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])
+        enclosed[border_labels] = False
+        enclosed[0] = False
+        tint |= enclosed[lab].astype(np.uint8)
+        mask |= tint
+
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (open_px, open_px)))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(
