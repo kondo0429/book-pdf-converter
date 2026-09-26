@@ -656,8 +656,8 @@ def remove_margin_background(
                    count as text, so the margin bands extend over them.
         protect_mask: Optional bool mask of print that must never be painted
                       (colored areas, which may bleed off the page edge). It
-                      is restored after every pass and counts toward the
-                      returned extent.
+                      is restored after every pass but does not count toward
+                      the returned extent.
 
     Returns:
         Tuple of:
@@ -939,12 +939,11 @@ def remove_margin_background(
     scrub &= faint & ~preserve
     out[scrub] = paper
 
-    if protect_mask is not None and protect_mask.any():
+    # The extent stays the text's: it places and scales the page in the output
+    # frame, and a band bleeding off the edges would widen it to the whole
+    # sheet, so the trim would cut into the running head and page number.
+    if protect_mask is not None:
         out[protect_mask] = image[protect_mask]
-        pr = np.where(protect_mask.any(axis=1))[0]
-        pc = np.where(protect_mask.any(axis=0))[0]
-        top, bottom = min(top, int(pr[0])), max(bottom, int(pr[-1]) + 1)
-        left, right = min(left, int(pc[0])), max(right, int(pc[-1]) + 1)
 
     if debug_out is not None:
         _t5 = time.perf_counter()
